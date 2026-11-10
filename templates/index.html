@@ -218,7 +218,7 @@
     </section>
 
     <section class="card control-card">
-      <div class="card-head"><h2>量程 / 速率 / 触发</h2></div>
+      <div class="card-head"><h2>量程 / 速率 / 触发 / 积分</h2></div>
       <div class="form-row">
         <label for="rangeSelect">量程</label>
         <select id="rangeSelect"></select>
@@ -230,6 +230,21 @@
       <div class="form-row">
         <label for="triggerSelect">触发源</label>
         <select id="triggerSelect"></select>
+      </div>
+      <div class="it-block">
+        <div class="it-head">
+          <span>任意积分时间</span>
+          <span id="itReadback" class="it-readback">—</span>
+        </div>
+        <div class="it-controls">
+          <input id="itValue" type="number" step="any" inputmode="decimal" placeholder="如 1.5">
+          <select id="itUnit">
+            <option value="plc">PLC</option>
+            <option value="s">秒</option>
+          </select>
+          <button id="itApply" class="btn btn-ghost btn-sm">应用</button>
+        </div>
+        <p class="hint">0.02–100 PLC 或 0.00001–10 s；应用后切换为 PR0 自由采样</p>
       </div>
       <div class="readback" id="readbackChips"></div>
       <div class="btn-row">

@@ -148,9 +148,12 @@ ADVANCED_GROUPS = [
                  action="KDM", action_label="取当前读数"),
             _adv("maxmin", "MAX/MIN 计算", "select", "MN{}", "MN?", options=[
                 ["MN0", "关"], ["MN1", "开"]]),
-            _adv("max", "MAX 值", "readout", query="MAX?", hint="需先开启 MAX/MIN 计算"),
-            _adv("min", "MIN 值", "readout", query="MIN?", hint="需先开启 MAX/MIN 计算"),
-            _adv("ave", "平均值", "readout", query="AVE?", hint="需先开启 MAX/MIN 计算"),
+            _adv("max", "MAX 值", "readout", query="MAX?", hint="需先开启 MAX/MIN 计算",
+                 first_message=True),
+            _adv("min", "MIN 值", "readout", query="MIN?", hint="需先开启 MAX/MIN 计算",
+                 first_message=True),
+            _adv("ave", "平均值", "readout", query="AVE?", hint="需先开启 MAX/MIN 计算",
+                 first_message=True),
             _adv("avn", "平均次数", "readout", query="AVN?", hint="需先开启 MAX/MIN 计算"),
         ],
     },
@@ -217,8 +220,8 @@ ADVANCED_GROUPS = [
             _adv("scnt", "统计样本数", "readout", query="SCNT?"),
             _adv("smax", "统计最大值", "readout", query="SMAX?"),
             _adv("smin", "统计最小值", "readout", query="SMIN?"),
-            _adv("stb", "状态字节 STB", "readout", query="*STB?"),
-            _adv("esr", "事件状态 ESR", "readout", query="*ESR?"),
+            _adv("stb", "状态字节 STB", "readout", query="*STB?", first_message=True),
+            _adv("esr", "事件状态 ESR", "readout", query="*ESR?", first_message=True),
             _adv("cls", "清除状态", "action", "*CLS", "*STB?", action_label="清除"),
             _adv("rst", "仪器复位", "action", "*RST", action_label="复位",
                  confirm="确定要复位仪器吗？所有设置将恢复默认。", state_after=True),
@@ -1137,7 +1140,8 @@ def api_advanced_read():
             values[key] = {"ok": False, "error": "该设置不支持读取"}
             continue
         try:
-            values[key] = {"ok": True, "value": dmm.query_command(item["query"])}
+            values[key] = {"ok": True, "value": dmm.query_command(
+                item["query"], first_message=item.get("first_message", False))}
         except dmm7461a.DMMError as exc:
             values[key] = {"ok": False, "error": str(exc),
                            "code": getattr(exc, "code", "error")}
@@ -1185,7 +1189,9 @@ def api_advanced_set():
     dmm = hub().dmm
     try:
         dmm.send_command(cmd)
-        reply = dmm.query_command(item["query"]) if item.get("query") else None
+        reply = (dmm.query_command(item["query"],
+                                   first_message=item.get("first_message", False))
+                 if item.get("query") else None)
         if item.get("state_after"):
             dmm.sync_state()
     except (dmm7461a.DMMError, ValueError) as exc:
@@ -1224,7 +1230,9 @@ def api_advanced_action():
 
     try:
         dmm.send_command(cmd)
-        reply = dmm.query_command(item["query"]) if item.get("query") else None
+        reply = (dmm.query_command(item["query"],
+                                   first_message=item.get("first_message", False))
+                 if item.get("query") else None)
         if item.get("state_after"):
             dmm.sync_state()
     except (dmm7461a.DMMError, ValueError) as exc:

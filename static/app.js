@@ -63,6 +63,8 @@
   ];
 
   const fmtCache = {};
+  let itLastDeviceState = null;
+  let itLoading = false;
 
   // ------------------------------------------------------------------
   // 工具
@@ -231,8 +233,83 @@
       : (state.config.display_mode === 'current'
           ? '分流电流模式使用 DCV 档；点击其它功能会自动退出分流模式。'
           : '选择后立即生效，以仪器回读值为准。');
+    if (st === 'online' && itLastDeviceState !== 'online') {
+      itLastDeviceState = 'online';
+      loadIntegrationTime();
+    } else if (st !== 'online') {
+      itLastDeviceState = st;
+      const itEl = $('itReadback');
+      if (itEl) itEl.textContent = '当前：—';
+    }
     setZoomUI();
   }
+
+  async function loadIntegrationTime() {
+    const el = $('itReadback');
+    if (!el) return;
+    if ((state.device.state || 'offline') !== 'online') {
+      el.textContent = '当前：—';
+      return;
+    }
+    if (itLoading) return;
+    itLoading = true;
+    try {
+      const d = await api('/api/advanced/read?keys=itp,its');
+      const itp = d.values && d.values.itp;
+      const its = d.values && d.values.its;
+      const parts = [];
+      if (itp && itp.ok) {
+        const n = parseAdvNumber(itp.value);
+        if (n !== null) parts.push(trimNum(n) + ' PLC');
+      }
+      if (its && its.ok) {
+        const n = parseAdvNumber(its.value);
+        if (n !== null) parts.push(trimNum(n) + ' s');
+      }
+      el.textContent = parts.length ? '当前：' + parts.join(' / ') : '当前：—';
+    } catch (_) {
+      el.textContent = '当前：—';
+    } finally {
+      itLoading = false;
+    }
+  }
+
+  async function applyIntegrationTime() {
+    if ((state.device.state || 'offline') !== 'online') {
+      showToast('设备未连接，无法设置积分时间', 'error');
+      return;
+    }
+    const value = parseFloat($('itValue').value);
+    if (!Number.isFinite(value)) {
+      showToast('请输入有效的积分时间', 'error');
+      return;
+    }
+    const unit = $('itUnit').value;
+    const key = unit === 'plc' ? 'itp' : 'its';
+    const min = unit === 'plc' ? 0.02 : 0.00001;
+    const max = unit === 'plc' ? 100 : 10;
+    if (value < min || value > max) {
+      showToast(`范围 ${min} – ${max} ${unit === 'plc' ? 'PLC' : 's'}`, 'error');
+      return;
+    }
+    const btn = $('itApply');
+    btn.disabled = true;
+    try {
+      await postJSON('/api/advanced/set', { key, value });
+      showToast('积分时间已设置，已切换为自由采样', 'ok');
+      await loadIntegrationTime();
+      if (!$('advDrawer').classList.contains('hidden')) loadAdvKeys(['itp', 'its']);
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  $('itApply').addEventListener('click', applyIntegrationTime);
+  $('itUnit').addEventListener('change', () => {
+    $('itValue').placeholder = $('itUnit').value === 'plc' ? '如 1.5' : '如 0.02';
+  });
 
   function renderReadout(sample) {
     const s = sample || state.latest;
@@ -1687,6 +1764,7 @@
         readback.className = 'adv-readback ok';
       }
       showToast(item.label + ' 已设置', 'ok');
+      if (item.key === 'itp' || item.key === 'its') loadIntegrationTime();
     } catch (err) {
       showToast(err.message, 'error');
       if (readback) {

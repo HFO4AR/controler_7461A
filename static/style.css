@@ -205,6 +205,27 @@ body {
 
 .readback { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 
+/* ---------- 任意积分时间 ---------- */
+.it-block {
+  margin: 10px 0 4px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+.it-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+  font-size: 12px; color: var(--ink-2);
+}
+.it-readback {
+  font-size: 11px; color: var(--muted);
+  text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.it-controls { display: flex; align-items: center; gap: 6px; }
+.it-controls input { flex: 1 1 auto; min-width: 0; }
+.it-controls select { flex: 0 0 72px; width: 72px; }
+.it-controls button { flex: 0 0 auto; }
+
 .card {
   position: relative;
   background: var(--panel);

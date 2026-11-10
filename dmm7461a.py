@@ -520,17 +520,19 @@ class DMM7461A(_StateMixin):
             if tr:
                 self._host_state["trigger"] = tr
 
-    def query_command(self, text: str) -> str:
+    def query_command(self, text: str, first_message: bool = False) -> str:
         """发送查询命令并返回原始应答。
 
-        注意：MAX?/MIN?/AVE? 的应答形如 "DCVM +2.3E-02"，*STB?/*ESR? 是纯数字，
-        与连续测量数据无法从格式上区分。实测仪器总是把查询应答作为查询后的
-        第一条消息发出，因此这里直接返回第一条消息。
+        普通查询应答（ITP+/RE/FL 等）用正则跳过测量数据流；只有
+        MAX?/MIN?/AVE?（应答形如 "DCVM +2.3E-02"）和 *STB?/*ESR?（纯数字）
+        与测量数据格式无法区分，必须直接取查询后的第一条消息。
         """
         text = text.strip()
         if not text:
             raise ValueError("空查询")
-        return self._submit(lambda: self._query_first_locked(text))
+        if first_message:
+            return self._submit(lambda: self._query_first_locked(text))
+        return self._submit(lambda: self._query_locked(text, r"."))
 
     def _query_first_locked(self, cmd: str, deadline: float = 1.2) -> str:
         self._write(cmd + "\n")
@@ -1024,7 +1026,7 @@ class SimulatedDMM(_StateMixin):
             self._publish_status()
         return {"ok": True}
 
-    def query_command(self, text: str) -> str:
+    def query_command(self, text: str, first_message: bool = False) -> str:
         self._ensure_remote()
         q = text.strip().upper()
         return self._adv.get(q, self._ADV_DEFAULTS.get(q, "OK"))

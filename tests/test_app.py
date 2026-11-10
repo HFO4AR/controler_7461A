@@ -81,6 +81,16 @@ class AppTests(unittest.TestCase):
         lim = self.json(r)["limits"]["voltage"]
         self.assertTrue(lim["enabled"])
 
+    def test_arbitrary_integration_time(self):
+        r = self.client.post("/api/advanced/set", json={"key": "itp", "value": 2.5})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("ITP", self.json(r)["value"])
+        r = self.client.post("/api/advanced/set", json={"key": "its", "value": 0.01})
+        self.assertEqual(r.status_code, 200)
+        d = self.json(self.client.get("/api/advanced/read?keys=itp,its"))
+        self.assertTrue(d["values"]["itp"]["ok"])
+        self.assertTrue(d["values"]["its"]["ok"])
+
     def test_extended_stats_fields(self):
         time.sleep(0.4)
         st = self.json(self.client.get("/api/state"))["stats"]
