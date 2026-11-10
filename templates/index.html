@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ADCMT 7461A 上位机</title>
+<script>
+  try {
+    var t = localStorage.getItem('dmm-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+  } catch (e) {}
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">7461A</span>
+    <span class="brand-text">数字万用表上位机</span>
+  </div>
+  <div class="topbar-right">
+    <div class="conn">
+      <span id="statusLed" class="led offline"></span>
+      <span id="statusText">正在连接…</span>
+    </div>
+    <div id="logIndicator" class="log-indicator hidden">
+      <span class="rec-dot"></span>记录中
+    </div>
+    <button id="advOpen" class="btn btn-ghost btn-sm">高级设置</button>
+    <button id="themeToggle" class="icon-btn" title="切换深色/浅色主题" aria-label="切换主题">
+      <svg id="iconMoon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg id="iconSun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="hidden"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+  <div class="main-col">
+
+    <div class="main-top">
+      <!-- 读数页 -->
+      <section class="card readout-card">
+        <div class="page-head">
+          <div class="page-title-wrap">
+            <span class="page-kicker">测量功能页</span>
+            <h1 id="pageTitle">直流电压</h1>
+          </div>
+          <span id="pageCode" class="code-pill">DCV</span>
+        </div>
+        <p id="pageNote" class="page-note">—</p>
+
+        <div class="readout-tags">
+          <span id="modeBadge" class="badge badge-voltage">电压</span>
+          <span id="rangeLabel" class="tag">—</span>
+          <span id="rateLabel" class="tag">—</span>
+          <span id="sampleRate" class="tag">—</span>
+          <span id="triggerLabel" class="tag">—</span>
+          <span id="deviceId" class="tag tag-muted" title="仪器身份">—</span>
+        </div>
+        <div class="readout" id="readout">
+          <span id="valueText" class="value">--</span>
+          <span id="unitText" class="unit">V</span>
+        </div>
+        <div id="alarmBanner" class="alarm-banner hidden"></div>
+        <div class="readout-foot">
+          <span id="burdenItem" class="hidden">Burden 电压 <b id="burdenText">—</b></span>
+          <span id="shuntItem" class="hidden">分流电阻 <b id="shuntInfo">—</b></span>
+          <span>样本 <b id="sampleCount">0</b></span>
+        </div>
+      </section>
+
+      <!-- 趋势图 -->
+      <section class="card chart-card">
+        <div class="card-head">
+          <h2 id="chartTitle">实时电压趋势 (V)</h2>
+          <div class="head-tools">
+            <div class="seg" id="windowGroup">
+              <button data-window="10">10s</button>
+              <button data-window="30">30s</button>
+              <button data-window="60" class="active">60s</button>
+              <button data-window="300">5min</button>
+              <button data-window="0">全部</button>
+            </div>
+            <button id="tableToggle" class="btn btn-ghost btn-sm">表格</button>
+          </div>
+        </div>
+        <div class="chart-wrap" id="chartWrap">
+          <canvas id="chart" tabindex="0" aria-label="实时趋势图"></canvas>
+          <div id="chartEmpty" class="chart-empty">等待数据…</div>
+          <div id="chartTip" class="chart-tip hidden"></div>
+        </div>
+        <div id="tableWrap" class="table-wrap hidden">
+          <table>
+            <thead><tr><th>时间</th><th id="tableUnitHead">值 (V)</th><th>状态</th></tr></thead>
+            <tbody id="sampleTable"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- 统计 -->
+    <section class="card stats-card">
+      <div class="card-head">
+        <h2>统计</h2>
+        <button id="statsReset" class="btn btn-ghost btn-sm">重置</button>
+      </div>
+      <div class="stats-grid">
+        <div class="stat"><label>最小值</label><b id="statMin">—</b></div>
+        <div class="stat"><label>最大值</label><b id="statMax">—</b></div>
+        <div class="stat"><label>平均值</label><b id="statAvg">—</b></div>
+        <div class="stat"><label>峰峰值</label><b id="statPP">—</b></div>
+        <div class="stat"><label>标准差</label><b id="statStd">—</b></div>
+        <div class="stat"><label>有效 / 总数</label><b id="statCount">0 / 0</b></div>
+        <div class="stat"><label>OL 次数</label><b id="statOL">0</b></div>
+        <div class="stat"><label>单位</label><b id="statUnit">V</b></div>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <!-- 分流测电流 -->
+      <section class="card shunt-card">
+        <div class="card-head"><h2>分流电阻测电流</h2></div>
+        <div class="seg seg-wide" id="modeGroup">
+          <button data-mode="voltage">直接测量</button>
+          <button data-mode="current">分流电流</button>
+        </div>
+        <div class="form-row">
+          <label for="shuntValue">采样电阻</label>
+          <div class="inline">
+            <input id="shuntValue" type="number" min="0" step="any" value="0.1" inputmode="decimal">
+            <select id="shuntUnit">
+              <option value="1">Ω</option>
+              <option value="0.001">mΩ</option>
+            </select>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="applyShunt" class="btn btn-primary">应用分流设置</button>
+        </div>
+        <p class="hint">I = V / R。分流模式会强制使用 DCV 档，请确认电阻功率与 burden 电压安全。</p>
+      </section>
+
+      <!-- 限值报警 -->
+      <section class="card limits-card">
+        <div class="card-head">
+          <h2>限值报警</h2>
+          <span id="limitModeLabel" class="tag">作用量：电压</span>
+        </div>
+        <label class="switch-row">
+          <input type="checkbox" id="limitEnabled">
+          <span>启用上下限报警</span>
+        </label>
+        <div class="form-row">
+          <label for="limitLow">下限</label>
+          <div class="inline">
+            <input id="limitLow" type="number" step="any" placeholder="如 0.004">
+            <select id="limitLowUnit"></select>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="limitHigh">上限</label>
+          <div class="inline">
+            <input id="limitHigh" type="number" step="any" placeholder="如 0.030">
+            <select id="limitHighUnit"></select>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="applyLimits" class="btn btn-primary">应用限值</button>
+          <span id="limitState" class="tag">未启用</span>
+        </div>
+        <p class="hint" id="limitHint">限值作用于当前显示量；电阻/频率功能暂不支持软件限值。</p>
+      </section>
+    </div>
+
+    <!-- 数据记录 -->
+    <section class="card log-card">
+      <div class="card-head">
+        <h2>数据记录</h2>
+        <span id="logStatus" class="tag">未记录</span>
+      </div>
+      <div class="btn-row">
+        <button id="logStart" class="btn btn-primary">开始记录</button>
+        <button id="logStop" class="btn btn-ghost" disabled>停止记录</button>
+      </div>
+      <p class="hint" id="logFileInfo">CSV 保存到 data/logs/</p>
+      <div class="log-list-head">
+        <span>历史文件</span>
+        <button id="refreshLogs" class="btn btn-ghost btn-sm">刷新</button>
+      </div>
+      <div id="logList" class="log-list"></div>
+    </section>
+
+  </div>
+
+  <!-- 右侧：功能页切换栏 + 量程/速率 -->
+  <aside class="side-col">
+    <section class="card fn-card">
+      <div class="card-head">
+        <h2>测量功能</h2>
+        <span class="hint-inline">点击即切换</span>
+      </div>
+      <div id="fnList" class="fn-list"></div>
+    </section>
+
+    <section class="card control-card">
+      <div class="card-head"><h2>量程 / 速率 / 触发</h2></div>
+      <div class="form-row">
+        <label for="rangeSelect">量程</label>
+        <select id="rangeSelect"></select>
+      </div>
+      <div class="form-row">
+        <label for="rateSelect">采样速率</label>
+        <select id="rateSelect"></select>
+      </div>
+      <div class="form-row">
+        <label for="triggerSelect">触发源</label>
+        <select id="triggerSelect"></select>
+      </div>
+      <div class="readback" id="readbackChips"></div>
+      <div class="btn-row">
+        <button id="syncState" class="btn btn-ghost">刷新状态</button>
+      </div>
+      <p class="hint" id="controlHint">选择后立即生效，以仪器回读值为准。</p>
+    </section>
+  </aside>
+
+</main>
+
+<footer class="footer">
+  <span>ADCMT 7461A · USB USBTMC · ADC 命令语言</span>
+  <span id="serverInfo"></span>
+</footer>
+
+<div id="advBackdrop" class="drawer-backdrop hidden"></div>
+<aside id="advDrawer" class="drawer hidden" aria-hidden="true">
+  <div class="drawer-head">
+    <div>
+      <h2>高级设置</h2>
+      <p id="advSubtitle" class="hint">ADC 命令语言</p>
+    </div>
+    <div class="drawer-head-actions">
+      <button id="advRefresh" class="btn btn-ghost btn-sm">刷新</button>
+      <button id="advClose" class="icon-btn" aria-label="关闭高级设置">✕</button>
+    </div>
+  </div>
+  <div id="advBody" class="drawer-body"></div>
+</aside>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

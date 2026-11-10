@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime data
+data/settings.json
+data/logs/*.csv
+
+# OS / editor
+.DS_Store
