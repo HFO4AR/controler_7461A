@@ -73,7 +73,10 @@
       <!-- 趋势图 -->
       <section class="card chart-card">
         <div class="card-head">
-          <h2 id="chartTitle">实时电压趋势 (V)</h2>
+          <div class="chart-title-wrap">
+            <h2 id="chartTitle">实时电压趋势 (V)</h2>
+            <span id="zoomHint" class="zoom-hint-inline">滚轮缩放 · 拖动平移</span>
+          </div>
           <div class="head-tools">
             <div class="seg" id="windowGroup">
               <button data-window="10">10s</button>
@@ -89,6 +92,11 @@
           <canvas id="chart" tabindex="0" aria-label="实时趋势图"></canvas>
           <div id="chartEmpty" class="chart-empty">等待数据…</div>
           <div id="chartTip" class="chart-tip hidden"></div>
+          <div class="chart-tools">
+            <button id="zoomOut" title="缩小时间轴">−</button>
+            <button id="zoomIn" title="放大时间轴">+</button>
+            <button id="zoomLive" title="回到实时">实时</button>
+          </div>
         </div>
         <div id="tableWrap" class="table-wrap hidden">
           <table>
@@ -103,17 +111,23 @@
     <section class="card stats-card">
       <div class="card-head">
         <h2>统计</h2>
-        <button id="statsReset" class="btn btn-ghost btn-sm">重置</button>
+        <div class="head-tools">
+          <button id="statsConfigBtn" class="btn btn-ghost btn-sm">设置</button>
+          <button id="statsReset" class="btn btn-ghost btn-sm">重置</button>
+        </div>
       </div>
-      <div class="stats-grid">
-        <div class="stat"><label>最小值</label><b id="statMin">—</b></div>
-        <div class="stat"><label>最大值</label><b id="statMax">—</b></div>
-        <div class="stat"><label>平均值</label><b id="statAvg">—</b></div>
-        <div class="stat"><label>峰峰值</label><b id="statPP">—</b></div>
-        <div class="stat"><label>标准差</label><b id="statStd">—</b></div>
-        <div class="stat"><label>有效 / 总数</label><b id="statCount">0 / 0</b></div>
-        <div class="stat"><label>OL 次数</label><b id="statOL">0</b></div>
-        <div class="stat"><label>单位</label><b id="statUnit">V</b></div>
+      <div id="statsGrid" class="stats-grid"></div>
+      <div id="statsConfig" class="stats-config hidden">
+        <div class="stats-config-head">
+          <span>显示统计项</span>
+          <span id="statsConfigCount" class="hint-inline"></span>
+        </div>
+        <div id="statsConfigList" class="stats-config-list"></div>
+        <div class="btn-row">
+          <button id="statsConfigDefault" class="btn btn-ghost btn-sm">恢复默认</button>
+          <button id="statsConfigAll" class="btn btn-ghost btn-sm">全选</button>
+          <button id="statsConfigClose" class="btn btn-primary btn-sm">完成</button>
+        </div>
       </div>
     </section>
 

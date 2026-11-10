@@ -17,6 +17,7 @@
     samples: [],
     latest: null,
     windowSec: 60,
+    view: { live: true, start: 0, end: 0 },
     theme: document.documentElement.dataset.theme || 'dark',
     tableOpen: false,
     readoutDirty: false,
@@ -27,7 +28,39 @@
     limitsDirty: false,
     limitsMode: null,
     lastLogsFetch: 0,
+    statMetrics: null,
   };
+
+  const STAT_DEFS = [
+    { key: 'min', label: '最小值', fmt: 'si' },
+    { key: 'max', label: '最大值', fmt: 'si' },
+    { key: 'avg', label: '平均值', fmt: 'si' },
+    { key: 'median', label: '中位数', fmt: 'si' },
+    { key: 'rms', label: '均方根 RMS', fmt: 'si' },
+    { key: 'pp', label: '峰峰值', fmt: 'si' },
+    { key: 'std', label: '标准差（样本）', fmt: 'si' },
+    { key: 'std_pop', label: '标准差（总体）', fmt: 'si' },
+    { key: 'var_sample', label: '方差（样本）', fmt: 'si2' },
+    { key: 'mad', label: '中位绝对偏差', fmt: 'si' },
+    { key: 'mean_abs_dev', label: '平均绝对偏差', fmt: 'si' },
+    { key: 'crest', label: '波峰因数', fmt: 'plain' },
+    { key: 'slope', label: '趋势斜率', fmt: 'slope' },
+    { key: 'sum', label: '总和', fmt: 'si' },
+    { key: 'first', label: '首值', fmt: 'si' },
+    { key: 'last', label: '末值', fmt: 'si' },
+    { key: 'min_t', label: '最小值时间', fmt: 'time' },
+    { key: 'max_t', label: '最大值时间', fmt: 'time' },
+    { key: 'n', label: '有效样本', fmt: 'int' },
+    { key: 'n_total', label: '总样本', fmt: 'int' },
+    { key: 'n_ol', label: 'OL 次数', fmt: 'int' },
+    { key: 'ol_ratio', label: 'OL 比例', fmt: 'percent' },
+    { key: 'rate_hz', label: '采样率', fmt: 'rate' },
+    { key: 'duration', label: '统计时长', fmt: 'duration' },
+  ];
+  const DEFAULT_STAT_METRICS = [
+    'min', 'max', 'avg', 'pp', 'std', 'rms',
+    'median', 'slope', 'n', 'n_total', 'n_ol', 'ol_ratio',
+  ];
 
   const fmtCache = {};
 
@@ -279,27 +312,102 @@
     tag.className = cls;
   }
 
+  function formatStat(def, st, unit) {
+    const v = st[def.key];
+    if (v === null || v === undefined) return '—';
+    if (typeof v === 'number' && !Number.isFinite(v)) return '—';
+    switch (def.fmt) {
+      case 'si': {
+        const x = fmtEng(v, unit, 6);
+        return x.text + ' ' + x.unit;
+      }
+      case 'si2': {
+        const x = fmtEng(v, unit ? unit + '²' : '', 5);
+        return x.text + ' ' + x.unit;
+      }
+      case 'plain': return Number(v).toFixed(3);
+      case 'percent': return (Number(v) * 100).toFixed(2) + ' %';
+      case 'time': return timeStr(Number(v));
+      case 'int': return String(Math.round(Number(v)));
+      case 'rate': return Number(v).toFixed(1) + ' 样本/秒';
+      case 'duration': return Number(v).toFixed(2) + ' s';
+      case 'slope': {
+        const x = fmtEng(v, (unit || '') + '/s', 5);
+        return x.text + ' ' + x.unit;
+      }
+      default: return String(v);
+    }
+  }
+
   function renderStats() {
     const st = state.stats || {};
     const unit = st.unit || baseUnit();
-    const f = (v) => {
-      if (v === null || v === undefined) return '—';
-      const x = fmtEng(v, unit, 6);
-      return x.text + ' ' + x.unit;
-    };
-    setText('statMin', f(st.min));
-    setText('statMax', f(st.max));
-    setText('statAvg', f(st.avg));
-    setText('statPP', f(st.pp));
-    setText('statStd', f(st.std));
-    setText('statCount', `${st.n || 0} / ${st.n_total || 0}`);
-    setText('statOL', String(st.n_ol || 0));
-    setText('statUnit', unit);
+    const metrics = state.statMetrics || DEFAULT_STAT_METRICS;
+    const grid = $('statsGrid');
+    if (grid) {
+      if (!metrics.length) {
+        grid.innerHTML = '<div class="adv-note">请点击「设置」选择统计项</div>';
+      } else {
+        grid.innerHTML = metrics.map(key => {
+          const def = STAT_DEFS.find(d => d.key === key);
+          if (!def) return '';
+          return `<div class="stat"><label>${def.label}</label><b>${formatStat(def, st, unit)}</b></div>`;
+        }).join('');
+      }
+    }
     setText('sampleCount', String(st.n_total || 0));
     const rate = st.rate_hz;
     const online = (state.device.state || 'offline') === 'online';
     setText('sampleRate', rate ? `${Math.round(rate)} 样本/秒`
       : (online ? '等待数据' : '—'));
+    if ($('statsConfigCount')) {
+      $('statsConfigCount').textContent = `${metrics.length} / ${STAT_DEFS.length} 项`;
+    }
+  }
+
+  function loadStatMetrics() {
+    try {
+      const raw = JSON.parse(localStorage.getItem('dmm-stats') || 'null');
+      if (Array.isArray(raw)) {
+        const valid = STAT_DEFS.map(d => d.key).filter(k => raw.includes(k));
+        if (valid.length) return valid;
+      }
+    } catch (_) { /* ignore */ }
+    return [...DEFAULT_STAT_METRICS];
+  }
+
+  function saveStatMetrics() {
+    try {
+      localStorage.setItem('dmm-stats', JSON.stringify(state.statMetrics));
+    } catch (_) { /* ignore */ }
+  }
+
+  function renderStatsConfig() {
+    const list = $('statsConfigList');
+    if (!list) return;
+    const selected = new Set(state.statMetrics || []);
+    list.innerHTML = '';
+    for (const def of STAT_DEFS) {
+      const label = document.createElement('label');
+      label.className = 'stats-check';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.value = def.key;
+      cb.checked = selected.has(def.key);
+      cb.addEventListener('change', () => {
+        const set = new Set(state.statMetrics || []);
+        if (cb.checked) set.add(def.key); else set.delete(def.key);
+        state.statMetrics = STAT_DEFS.map(d => d.key).filter(k => set.has(k));
+        saveStatMetrics();
+        renderStats();
+      });
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(def.label));
+      list.appendChild(label);
+    }
+    if ($('statsConfigCount')) {
+      $('statsConfigCount').textContent = `${(state.statMetrics || []).length} / ${STAT_DEFS.length} 项`;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -603,6 +711,8 @@
       state.samples = [];
       state.latest = null;
       state.lastSeq = 0;
+      state.view = { live: true, start: 0, end: 0 };
+      setZoomUI();
       chart.dirty = true;
     }
     renderDevice();
@@ -640,6 +750,8 @@
     if (s.ctx !== state.contextId) {
       state.contextId = s.ctx;
       state.samples = [];
+      state.view = { live: true, start: 0, end: 0 };
+      setZoomUI();
       chart.dirty = true;
     }
     state.samples.push(s);
@@ -674,9 +786,42 @@
     });
   }
 
-  async function fetchHistory() {
+  function currentDomain() {
+    const latestT = state.latest ? state.latest.t : Date.now() / 1000;
+    if (!state.view.live && state.view.end > state.view.start) {
+      return { tMin: state.view.start, tMax: state.view.end, free: true };
+    }
+    if (state.windowSec > 0) {
+      return { tMin: latestT - state.windowSec, tMax: latestT, free: false };
+    }
+    let firstT = null;
+    for (const s of state.samples) {
+      if (s.ctx === state.contextId) { firstT = s.t; break; }
+    }
+    const tMin = firstT !== null ? Math.min(firstT, latestT - 1) : latestT - 60;
+    return { tMin, tMax: Math.max(latestT, tMin + 1), free: false };
+  }
+
+  function oldestLoadedT() {
+    for (const s of state.samples) {
+      if (s.ctx === state.contextId) return s.t;
+    }
+    return Infinity;
+  }
+
+  let historyTimer = null;
+  function ensureHistory() {
+    clearTimeout(historyTimer);
+    historyTimer = setTimeout(() => {
+      if (!state.view.live && state.view.start < oldestLoadedT() - 0.5) {
+        fetchHistory(0);
+      }
+    }, 350);
+  }
+
+  async function fetchHistory(seconds = null) {
     try {
-      const q = state.windowSec || 0;
+      const q = seconds === null ? (state.windowSec || 0) : seconds;
       const d = await api(`/api/history?seconds=${q}`);
       if (d.context_id !== state.contextId) return;
       const map = new Map(state.samples.map(s => [s.seq, s]));
@@ -712,8 +857,10 @@
     new ResizeObserver(resize).observe(chart.canvas);
     resize();
 
+    let drag = null;
+
     chart.canvas.addEventListener('mousemove', (ev) => {
-      if (!chart.visible.length) return;
+      if (drag || !chart.visible.length) return;
       const rect = chart.canvas.getBoundingClientRect();
       const x = ev.clientX - rect.left;
       // px 单调递增，二分查找最近点
@@ -744,6 +891,98 @@
         chart.cross = null; chart.dirty = true;
       }
     });
+
+    // 滚轮缩放时间轴（以鼠标位置为中心）
+    chart.canvas.addEventListener('wheel', (ev) => {
+      if (!chart.geom) return;
+      ev.preventDefault();
+      const rect = chart.canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const g = chart.geom;
+      const dom = currentDomain();
+      const ratio = Math.min(1, Math.max(0, (x - g.l) / g.plotW));
+      const cursorT = dom.tMin + ratio * (dom.tMax - dom.tMin);
+      const span = dom.tMax - dom.tMin;
+      const factor = Math.exp(ev.deltaY * 0.0015);
+      const newSpan = Math.min(3600, Math.max(0.2, span * factor));
+      const newTMin = cursorT - ratio * newSpan;
+      state.view = { live: false, start: newTMin, end: newTMin + newSpan };
+      setZoomUI();
+      chart.cross = null;
+      chart.dirty = true;
+      ensureHistory();
+    }, { passive: false });
+
+    // 拖动平移
+    chart.canvas.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0 || !chart.geom) return;
+      drag = {
+        x: ev.clientX,
+        tMin: chart.geom.tMin,
+        tMax: chart.geom.tMax,
+        plotW: chart.geom.plotW,
+        moved: false,
+      };
+      chart.cross = null;
+      chart.dirty = true;
+      try { chart.canvas.setPointerCapture(ev.pointerId); } catch (_) {}
+      chart.canvas.style.cursor = 'grabbing';
+      ev.preventDefault();
+    });
+    chart.canvas.addEventListener('pointermove', (ev) => {
+      if (!drag) return;
+      const dx = ev.clientX - drag.x;
+      if (!drag.moved && Math.abs(dx) < 3) return;
+      drag.moved = true;
+      const span = drag.tMax - drag.tMin;
+      const dt = -(dx / drag.plotW) * span;
+      state.view = { live: false, start: drag.tMin + dt, end: drag.tMax + dt };
+      setZoomUI();
+      chart.dirty = true;
+      ensureHistory();
+    });
+    const endDrag = (ev) => {
+      if (!drag) return;
+      drag = null;
+      chart.canvas.style.cursor = '';
+      try { chart.canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
+    };
+    chart.canvas.addEventListener('pointerup', endDrag);
+    chart.canvas.addEventListener('pointercancel', endDrag);
+    chart.canvas.addEventListener('dblclick', (ev) => {
+      ev.preventDefault();
+      resetZoomView();
+    });
+  }
+
+  function setZoomUI() {
+    const live = state.view.live;
+    const liveBtn = $('zoomLive');
+    if (liveBtn) liveBtn.classList.toggle('active', live);
+    for (const b of $('windowGroup').querySelectorAll('button')) {
+      b.classList.toggle('active', live && parseInt(b.dataset.window, 10) === state.windowSec);
+    }
+    const hint = $('zoomHint');
+    if (hint) hint.textContent = live ? '滚轮缩放 · 拖动平移' : '已缩放 · 双击或点「实时」恢复';
+  }
+
+  function resetZoomView() {
+    state.view = { live: true, start: 0, end: 0 };
+    setZoomUI();
+    chart.dirty = true;
+    if (state.windowSec === 0 || state.windowSec > 60) fetchHistory();
+  }
+
+  function zoomBy(factor) {
+    if (!chart.geom) return;
+    const dom = currentDomain();
+    const mid = (dom.tMin + dom.tMax) / 2;
+    const span = Math.max(0.2, Math.min(3600, (dom.tMax - dom.tMin) * factor));
+    state.view = { live: false, start: mid - span / 2, end: mid + span / 2 };
+    setZoomUI();
+    chart.cross = null;
+    chart.dirty = true;
+    ensureHistory();
   }
 
   function niceStep(span, count) {
@@ -799,20 +1038,23 @@
     const unit = baseUnit();
     const emptyEl = $('chartEmpty');
 
-    const now = state.latest ? state.latest.t : Date.now() / 1000;
-    const cutoff = state.windowSec > 0 ? now - state.windowSec : -Infinity;
-    let pts = state.samples.filter(s => s.t >= cutoff && s.ctx === state.contextId);
+    const dom = currentDomain();
+    const tMin = dom.tMin;
+    const tMax = Math.max(dom.tMax, dom.tMin + 1e-6);
+    const marg = { l: 64, r: 16, t: 14, b: 26 };
+    const plotW = Math.max(1, W - marg.l - marg.r);
+    const plotH = Math.max(1, H - marg.t - marg.b);
+    chart.geom = { l: marg.l, plotW, tMin, tMax };
+    const xOf = (t) => marg.l + ((t - tMin) / (tMax - tMin)) * plotW;
+
+    let pts = state.samples.filter(s => s.t >= tMin && s.t <= tMax && s.ctx === state.contextId);
     if (!pts.length) {
-      emptyEl.textContent = '等待数据…';
+      emptyEl.textContent = dom.free ? '该时间段没有数据（拖动或缩小查看）' : '等待数据…';
       emptyEl.classList.remove('hidden');
       chart.visible = [];
       return;
     }
     emptyEl.classList.add('hidden');
-
-    const marg = { l: 64, r: 16, t: 14, b: 26 };
-    const plotW = Math.max(1, W - marg.l - marg.r);
-    const plotH = Math.max(1, H - marg.t - marg.b);
 
     const numeric = pts.filter(p => p.d !== null && p.d !== undefined && Number.isFinite(p.d));
     if (!numeric.length) {
@@ -832,15 +1074,6 @@
       yMin -= pad; yMax += pad;
     }
 
-    let tMin, tMax;
-    if (state.windowSec > 0) {
-      tMax = now; tMin = now - state.windowSec;
-    } else {
-      tMin = pts[0].t; tMax = pts[pts.length - 1].t;
-      if (tMax - tMin < 1) tMax = tMin + 1;
-    }
-
-    const xOf = (t) => marg.l + ((t - tMin) / (tMax - tMin)) * plotW;
     const yOf = (v) => marg.t + (1 - (v - yMin) / (yMax - yMin)) * plotH;
 
     // OL 区间底色（超量程时折线断开，这里给出明确提示）
@@ -892,17 +1125,18 @@
     ctx.stroke();
     ctx.fillStyle = colors.muted;
     ctx.textAlign = 'center';
-    if (state.windowSec > 0) {
+    if (!dom.free && state.windowSec > 0) {
       for (const frac of [0, 0.25, 0.5, 0.75, 1]) {
-        const sec = -state.windowSec * (1 - frac);
+        const sec = -(tMax - tMin) * (1 - frac);
         const x = marg.l + frac * plotW;
         ctx.fillText(sec === 0 ? '0' : `${Math.round(sec)}s`, x, marg.t + plotH + 14);
       }
     } else {
-      for (const frac of [0, 0.5, 1]) {
+      const shortSpan = (tMax - tMin) < 2;
+      for (const frac of [0, 0.25, 0.5, 0.75, 1]) {
         const t = tMin + (tMax - tMin) * frac;
-        const d = new Date(t * 1000);
-        const lab = d.toLocaleTimeString('zh-CN', { hour12: false });
+        const lab = shortSpan ? timeStr(t)
+          : new Date(t * 1000).toLocaleTimeString('zh-CN', { hour12: false });
         ctx.fillText(lab, marg.l + frac * plotW, marg.t + plotH + 14);
       }
     }
@@ -929,7 +1163,14 @@
 
     // 数据线（OL / 断档处断开）
     const drawPts = decimate(pts, Math.max(1000, Math.round(plotW * 2)));
-    const gap = 1.0;
+    let gap = 1.0;
+    if (pts.length > 2) {
+      const diffs = [];
+      for (let i = 1; i < pts.length; i++) diffs.push(pts[i].t - pts[i - 1].t);
+      diffs.sort((a, b) => a - b);
+      const med = diffs[Math.floor(diffs.length / 2)];
+      if (med > 0) gap = Math.max(0.5, med * 4);
+    }
     let prev = null;
     ctx.strokeStyle = colors.accent;
     ctx.lineWidth = 2;
@@ -1113,6 +1354,25 @@
     catch (err) { showToast(err.message, 'error'); }
   });
 
+  $('statsConfigBtn').addEventListener('click', () => {
+    const panel = $('statsConfig');
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) renderStatsConfig();
+  });
+  $('statsConfigClose').addEventListener('click', () => $('statsConfig').classList.add('hidden'));
+  $('statsConfigDefault').addEventListener('click', () => {
+    state.statMetrics = [...DEFAULT_STAT_METRICS];
+    saveStatMetrics();
+    renderStatsConfig();
+    renderStats();
+  });
+  $('statsConfigAll').addEventListener('click', () => {
+    state.statMetrics = STAT_DEFS.map(d => d.key);
+    saveStatMetrics();
+    renderStatsConfig();
+    renderStats();
+  });
+
   $('logStart').addEventListener('click', async () => {
     try { const d = await postJSON('/api/log/start', {}); state.logging = d.logging; renderLogging(); fetchLogs(); }
     catch (err) { showToast(err.message, 'error'); }
@@ -1150,11 +1410,16 @@
   $('windowGroup').addEventListener('click', (ev) => {
     const btn = ev.target.closest('button');
     if (!btn) return;
-    for (const b of $('windowGroup').querySelectorAll('button')) b.classList.toggle('active', b === btn);
     state.windowSec = parseInt(btn.dataset.window, 10);
+    state.view = { live: true, start: 0, end: 0 };
+    setZoomUI();
     chart.dirty = true;
     if (state.windowSec === 0 || state.windowSec > 60) fetchHistory();
   });
+
+  $('zoomIn').addEventListener('click', () => zoomBy(1 / 1.6));
+  $('zoomOut').addEventListener('click', () => zoomBy(1.6));
+  $('zoomLive').addEventListener('click', resetZoomView);
 
   // ------------------------------------------------------------------
   // 高级设置抽屉
@@ -1450,7 +1715,11 @@
   // ------------------------------------------------------------------
   async function init() {
     applyTheme(state.theme);
+    state.statMetrics = loadStatMetrics();
     setupChart();
+    setZoomUI();
+    renderStatsConfig();
+    renderStats();
     requestAnimationFrame(chartTick);
 
     try {

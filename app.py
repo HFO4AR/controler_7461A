@@ -258,11 +258,23 @@ class Stats:
         self.n_ol = 0
         self.min = None
         self.max = None
+        self.min_t = None
+        self.max_t = None
         self.mean = 0.0
         self.m2 = 0.0
+        self.sum = 0.0
+        self.sum_sq = 0.0
+        self.sum_t = 0.0
+        self.sum_tt = 0.0
+        self.sum_tx = 0.0
+        self.first = None
+        self.last = None
+        self.first_t = None
+        self.last_t = None
         self.since = time.time()
 
-    def add(self, value, ol: bool):
+    def add(self, value, ol: bool, t: float | None = None):
+        now = time.time() if t is None else t
         self.n_total += 1
         if ol or value is None:
             self.n_ol += 1
@@ -270,25 +282,61 @@ class Stats:
         self.n += 1
         if self.min is None or value < self.min:
             self.min = value
+            self.min_t = now
         if self.max is None or value > self.max:
             self.max = value
+            self.max_t = now
+        if self.first is None:
+            self.first = value
+            self.first_t = now
+        self.last = value
+        self.last_t = now
+        self.sum += value
+        self.sum_sq += value * value
+        rt = now - self.since
+        self.sum_t += rt
+        self.sum_tt += rt * rt
+        self.sum_tx += rt * value
         delta = value - self.mean
         self.mean += delta / self.n
         self.m2 += delta * (value - self.mean)
 
     def as_dict(self):
-        std = math.sqrt(self.m2 / (self.n - 1)) if self.n > 1 else 0.0
-        pp = (self.max - self.min) if self.n else 0.0
+        n = self.n
+        std = math.sqrt(self.m2 / (n - 1)) if n > 1 else 0.0
+        std_pop = math.sqrt(self.m2 / n) if n else 0.0
+        var_sample = self.m2 / (n - 1) if n > 1 else 0.0
+        rms = math.sqrt(self.sum_sq / n) if n else None
+        pp = (self.max - self.min) if n else 0.0
+        denom = n * self.sum_tt - self.sum_t * self.sum_t
+        slope = ((n * self.sum_tx - self.sum_t * self.sum) / denom
+                 if n > 1 and abs(denom) > 1e-12 else 0.0)
+        max_abs = max(abs(self.min), abs(self.max)) if n else None
+        crest = (max_abs / rms) if (rms and rms > 0) else None
+        duration = ((self.last_t - self.first_t)
+                    if (self.first_t is not None and self.last_t is not None) else 0.0)
         return {
             "ctx": self.context_id,
-            "n": self.n,
+            "n": n,
             "n_total": self.n_total,
             "n_ol": self.n_ol,
             "min": self.min,
             "max": self.max,
-            "avg": self.mean if self.n else None,
+            "avg": self.mean if n else None,
             "pp": pp,
             "std": std,
+            "std_pop": std_pop,
+            "var_sample": var_sample,
+            "rms": rms,
+            "sum": self.sum if n else None,
+            "first": self.first,
+            "last": self.last,
+            "min_t": self.min_t,
+            "max_t": self.max_t,
+            "slope": slope,
+            "crest": crest,
+            "ol_ratio": (self.n_ol / self.n_total) if self.n_total else 0.0,
+            "duration": duration,
             "unit": self.unit,
             "since": self.since,
         }
@@ -390,6 +438,7 @@ class Hub:
         self.context_key = None
         self.stats = Stats()
         self._rate_times = deque(maxlen=8192)
+        self._ext_cache = None
         self.config = {"display_mode": "voltage", "shunt_ohm": 0.1}
         self.limits = {
             "voltage": {"enabled": False, "low": None, "high": None},
@@ -416,6 +465,7 @@ class Hub:
         self.context_id += 1
         self.samples.clear()
         self._rate_times.clear()
+        self._ext_cache = None
         self.stats.reset(unit, self.context_id)
         LOG.info("测量上下文切换 #%s %s", self.context_id, reason)
 
@@ -427,8 +477,32 @@ class Hub:
         n = sum(1 for t in self._rate_times if t >= cutoff)
         return n / 2.0
 
+    def _extended_stats(self) -> dict:
+        """中位数/MAD/平均绝对偏差需要排序，缓存 1 秒，避免每个样本都计算。"""
+        now = time.time()
+        if self._ext_cache and now - self._ext_cache[0] < 1.0:
+            return self._ext_cache[1]
+        vals = [s["d"] for s in self.samples
+                if s["ctx"] == self.context_id and s["d"] is not None and not s["ol"]]
+        if vals:
+            vals_sorted = sorted(vals)
+            n = len(vals_sorted)
+            median = (vals_sorted[n // 2] if n % 2
+                      else (vals_sorted[n // 2 - 1] + vals_sorted[n // 2]) / 2)
+            absdev = sorted(abs(v - median) for v in vals)
+            mad = (absdev[n // 2] if n % 2
+                   else (absdev[n // 2 - 1] + absdev[n // 2]) / 2)
+            mean = sum(vals) / n
+            mean_abs_dev = sum(abs(v - mean) for v in vals) / n
+        else:
+            median = mad = mean_abs_dev = None
+        data = {"median": median, "mad": mad, "mean_abs_dev": mean_abs_dev}
+        self._ext_cache = (now, data)
+        return data
+
     def _stats_payload(self) -> dict:
         payload = self.stats.as_dict()
+        payload.update(self._extended_stats())
         payload["rate_hz"] = round(self._sample_rate(), 1)
         return payload
 
@@ -493,8 +567,9 @@ class Hub:
             }
             self.last_alarm = alarm
             self.samples.append(sample)
-            self._rate_times.append(raw_sample.get("t", time.time()))
-            self.stats.add(display, ol)
+            sample_t = raw_sample.get("t", time.time())
+            self._rate_times.append(sample_t)
+            self.stats.add(display, ol, sample_t)
 
             if self.logger.active:
                 elapsed = (time.monotonic() - self.logger.started_mono) if self.logger.started_mono else 0.0
@@ -601,6 +676,7 @@ class Hub:
     def reset_stats(self):
         with self.lock:
             unit = self.stats.unit
+            self._ext_cache = None
             self.stats.reset(unit, self.context_id)
             payload = self._stats_payload()
         self._broadcast("stats", payload)

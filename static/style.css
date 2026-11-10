@@ -311,8 +311,45 @@ body {
   border: 1px solid var(--border);
   overflow: hidden;
 }
-#chart { width: 100%; height: 100%; display: block; outline: none; }
+#chart {
+  width: 100%; height: 100%; display: block; outline: none;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
 #chart:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+
+.chart-tools {
+  position: absolute; top: 8px; right: 8px; z-index: 4;
+  display: flex; gap: 4px;
+}
+.chart-tools button {
+  min-width: 26px; height: 26px; padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  color: var(--ink-2);
+  font-family: inherit; font-size: 13px;
+  cursor: pointer;
+}
+.chart-tools button:hover { color: var(--ink); border-color: var(--accent); }
+.chart-tools button.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+}
+.chart-tools #zoomLive { font-size: 11px; }
+
+.chart-title-wrap {
+  display: flex; align-items: baseline; gap: 10px; min-width: 0;
+}
+.zoom-hint-inline {
+  font-size: 11px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+@media (max-width: 780px) {
+  .zoom-hint-inline { display: none; }
+}
 
 .chart-empty {
   position: absolute; inset: 0;
@@ -375,6 +412,42 @@ body {
   display: block; font-size: 14px; font-weight: 600;
   color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 统计项配置 ---------- */
+.stats-card { position: relative; }
+.stats-config {
+  position: absolute; left: 12px; right: 12px; top: 52px; z-index: 9;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+.stats-config-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+  font-size: 12px; color: var(--muted);
+}
+.stats-config-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 10px;
+  max-height: 280px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+  padding-right: 2px;
+}
+.stats-check {
+  display: flex; align-items: center; gap: 7px;
+  padding: 3px 2px;
+  font-size: 12px; color: var(--ink-2);
+  cursor: pointer;
+}
+.stats-check input {
+  width: 14px; height: 14px;
+  accent-color: var(--accent);
+  flex: 0 0 auto;
 }
 
 /* ---------- 表单 ---------- */

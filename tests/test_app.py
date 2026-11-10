@@ -71,6 +71,19 @@ class AppTests(unittest.TestCase):
         lim = self.json(r)["limits"]["voltage"]
         self.assertTrue(lim["enabled"])
 
+    def test_extended_stats_fields(self):
+        time.sleep(0.4)
+        st = self.json(self.client.get("/api/state"))["stats"]
+        for key in ("rms", "median", "mad", "mean_abs_dev", "std_pop",
+                    "var_sample", "slope", "crest", "sum", "first", "last",
+                    "min_t", "max_t", "ol_ratio", "duration"):
+            self.assertIn(key, st)
+        self.assertGreaterEqual(st["n"], 1)
+        self.assertIsNotNone(st["median"])
+        self.assertIsNotNone(st["rms"])
+        self.assertIsNotNone(st["first"])
+        self.assertIsNotNone(st["last"])
+
     def test_history(self):
         time.sleep(0.3)
         d = self.json(self.client.get("/api/history?seconds=60"))
