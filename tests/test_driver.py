@@ -49,6 +49,8 @@ class PollTests(unittest.TestCase):
         d = dmm.DMM7461A(on_status=events.append)
         d._fd = 1
         d._apply_instrument(function="DCV", range="AUTO", rate="PR3", trigger="TRS0")
+        d._host_state = {"function": "DCV", "range": "AUTO", "rate": "PR3", "trigger": "TRS0"}
+        d._auto_release = False
         d._query_locked = lambda cmd, pattern, deadline=0.8: replies[cmd]
         return d, events
 
@@ -67,6 +69,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(snap["range"], "R5")
         self.assertEqual(snap["rate"], "PR1")
         self.assertEqual(snap["trigger"], "TRS1")
+
 
 
 class IoctlTests(unittest.TestCase):

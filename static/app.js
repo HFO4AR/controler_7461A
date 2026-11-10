@@ -213,7 +213,9 @@
     let text = dev.message || (st === 'online' ? '已连接' : '未连接');
     if (!state.serverOnline) { st = 'offline'; text = '服务器未连接'; }
     const led = $('statusLed');
-    led.className = 'led ' + (st === 'online' ? 'online' : st === 'connecting' ? 'connecting' : 'offline');
+    led.className = 'led ' + (st === 'online' ? 'online'
+      : st === 'connecting' ? 'connecting'
+      : st === 'local' ? 'local' : 'offline');
     setText('statusText', text);
     setText('deviceId', dev.idn || '--');
 
@@ -229,6 +231,7 @@
       : (state.config.display_mode === 'current'
           ? '分流电流模式使用 DCV 档；点击其它功能会自动退出分流模式。'
           : '选择后立即生效，以仪器回读值为准。');
+    setZoomUI();
   }
 
   function renderReadout(sample) {
@@ -772,6 +775,11 @@
     es.onerror = () => { state.serverOnline = false; renderDevice(); };
     es.addEventListener('snapshot', (e) => { state.serverOnline = true; applySnapshot(JSON.parse(e.data)); });
     es.addEventListener('sample', (e) => onSample(JSON.parse(e.data)));
+    es.addEventListener('samples', (e) => {
+      const batch = JSON.parse(e.data);
+      if (!Array.isArray(batch)) return;
+      for (const s of batch) onSample(s);
+    });
     es.addEventListener('state', (e) => applyState(JSON.parse(e.data)));
     es.addEventListener('stats', (e) => {
       if (state.switching) return;
@@ -846,7 +854,7 @@
     chart.ctx = chart.canvas.getContext('2d');
     const resize = () => {
       const rect = chart.canvas.getBoundingClientRect();
-      chart.dpr = window.devicePixelRatio || 1;
+      chart.dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       chart.w = Math.max(1, rect.width);
       chart.h = Math.max(1, rect.height);
       chart.canvas.width = Math.round(chart.w * chart.dpr);
@@ -963,7 +971,9 @@
       b.classList.toggle('active', live && parseInt(b.dataset.window, 10) === state.windowSec);
     }
     const hint = $('zoomHint');
-    if (hint) hint.textContent = live ? '滚轮缩放 · 拖动平移' : '已缩放 · 双击或点「实时」恢复';
+    if (hint) {
+      hint.textContent = live ? '滚轮缩放 · 拖动平移' : '已缩放 · 双击或点「实时」恢复';
+    }
   }
 
   function resetZoomView() {
@@ -993,6 +1003,16 @@
     let step;
     if (norm <= 1) step = 1; else if (norm <= 2) step = 2; else if (norm <= 5) step = 5; else step = 10;
     return step * mag;
+  }
+
+  function lowerBound(arr, t) {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].t < t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   function decimate(points, maxPoints) {
@@ -1047,7 +1067,10 @@
     chart.geom = { l: marg.l, plotW, tMin, tMax };
     const xOf = (t) => marg.l + ((t - tMin) / (tMax - tMin)) * plotW;
 
-    let pts = state.samples.filter(s => s.t >= tMin && s.t <= tMax && s.ctx === state.contextId);
+    const arr = state.samples;
+    const startIdx = lowerBound(arr, tMin);
+    const endIdx = lowerBound(arr, tMax + 1e-9);
+    let pts = arr.slice(startIdx, endIdx);
     if (!pts.length) {
       emptyEl.textContent = dom.free ? '该时间段没有数据（拖动或缩小查看）' : '等待数据…';
       emptyEl.classList.remove('hidden');
@@ -1197,8 +1220,8 @@
     ctx.fillStyle = colors.accent;
     ctx.beginPath(); ctx.arc(lx, ly, 3.5, 0, Math.PI * 2); ctx.fill();
 
-    // 十字光标使用未降采样的原始点，避免取到插值/桶边界
-    chart.visible = pts.map(p => ({
+    // 十字光标使用降采样后的点，避免高速采样时每帧处理上万点
+    chart.visible = drawPts.map(p => ({
       px: xOf(p.t),
       py: (p.d === null || p.d === undefined) ? null : yOf(p.d),
       s: p,
@@ -1232,12 +1255,13 @@
 
   function chartTick() {
     const now = performance.now();
-    if (state.readoutDirty && !document.hidden && now - (chart.lastReadout || 0) >= 50) {
+    if (state.readoutDirty && !document.hidden && now - (chart.lastReadout || 0) >= 200) {
       chart.lastReadout = now;
       state.readoutDirty = false;
       renderReadout();
     }
-    if (chart.dirty && !document.hidden) {
+    if (chart.dirty && !document.hidden && now - (chart.lastDraw || 0) >= 200) {
+      chart.lastDraw = now;
       try { drawChart(); } catch (err) { console.error(err); }
       chart.dirty = false;
     }
@@ -1648,6 +1672,10 @@
   }
 
   async function setAdvValue(item, value, readback) {
+    if ((state.device.state || 'offline') !== 'online') {
+      showToast('设备未连接，无法下发设置', 'error');
+      return;
+    }
     if (value === '' || value === null || value === undefined) {
       showToast('请输入数值', 'error');
       return;
@@ -1669,6 +1697,10 @@
   }
 
   async function runAdvAction(item, btn) {
+    if ((state.device.state || 'offline') !== 'online') {
+      showToast('设备未连接，无法下发设置', 'error');
+      return;
+    }
     if (item.confirm && !window.confirm(item.confirm)) return;
     const old = btn.textContent;
     btn.disabled = true;

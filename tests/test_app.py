@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -11,6 +12,14 @@ import app as appmod
 class AppTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # 测试使用临时数据目录，避免把测试设置/日志写进真实 data/
+        cls._tmp = tempfile.TemporaryDirectory()
+        base = Path(cls._tmp.name)
+        appmod.DATA_DIR = base
+        appmod.LOG_DIR = base / "logs"
+        appmod.SETTINGS_FILE = base / "settings.json"
+        appmod.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
         cls.flask_app = appmod.build(sim=True)
         cls.client = cls.flask_app.test_client()
         time.sleep(0.4)
@@ -18,6 +27,7 @@ class AppTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         appmod.shutdown()
+        cls._tmp.cleanup()
 
     def json(self, resp):
         self.assertIsNotNone(resp)
@@ -164,6 +174,9 @@ class AppTests(unittest.TestCase):
         self.assertGreater(st.get("rate_hz", 0), 0)
 
     def test_units_follow_function_and_shunt(self):
+        # 先恢复到中速，避免前面测试留下的慢速档让样本更新过慢
+        self.client.post("/api/control", json={"action": "rate", "value": "PR3"})
+        time.sleep(0.2)
         # 电阻：单位 Ω，且不计算分流电流
         self.assertEqual(self.client.post(
             "/api/control", json={"action": "function", "value": "RES2W"}).status_code, 200)

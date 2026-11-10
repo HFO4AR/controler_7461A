@@ -87,6 +87,7 @@ body {
 .led.online { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent); }
 .led.offline { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 20%, transparent); }
 .led.connecting { background: var(--warn); animation: pulse 1.2s infinite; }
+.led.local { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
 @keyframes pulse { 50% { opacity: 0.35; } }
 
 .log-indicator {

@@ -46,6 +46,7 @@ USBTMC_IOCTL_CTRL_REQUEST = _ioc(3, 91, 8, 16)    # 0xC0105B08
 
 # USB488 类请求
 USB488_REN_CONTROL = 0xA0
+USB488_GOTO_LOCAL = 0xA1
 USBTMC_STATUS_SUCCESS = 0x01
 
 READ_TIMEOUT_MS = 250
@@ -74,6 +75,10 @@ class QueryTimeout(DMMError):
 
 class BusyError(DMMError):
     code = "busy"
+
+
+class LocalMode(DMMError):
+    code = "local_mode"
 
 
 class _Disconnected(Exception):
@@ -187,13 +192,21 @@ def parse_message(line: str):
     return "reply", line
 
 
-def _ren_control(fd: int) -> int:
-    """发送 USB488 REN_CONTROL（远程使能），返回状态字节。"""
+def _ren_control(fd: int, enable: bool = True) -> int:
+    """发送 USB488 REN_CONTROL（远程使能/撤销），返回状态字节。"""
     data = ctypes.create_string_buffer(1)
-    req = struct.pack("<BBHHH", 0xA1, USB488_REN_CONTROL, 1, 0, 1)
+    req = struct.pack("<BBHHH", 0xA1, USB488_REN_CONTROL, 1 if enable else 0, 0, 1)
     req += struct.pack("<Q", ctypes.addressof(data))
     fcntl.ioctl(fd, USBTMC_IOCTL_CTRL_REQUEST, bytearray(req), True)
     return data.raw[0]
+
+
+def _goto_local_control(fd: int):
+    """发送 USB488 GOTO_LOCAL（部分固件可能不支持，失败可忽略）。"""
+    data = ctypes.create_string_buffer(1)
+    req = struct.pack("<BBHHH", 0x21, USB488_GOTO_LOCAL, 0, 0, 0)
+    req += struct.pack("<Q", ctypes.addressof(data))
+    fcntl.ioctl(fd, USBTMC_IOCTL_CTRL_REQUEST, bytearray(req), True)
 
 
 def _ren_with_retry(fd: int, attempts: int = 3) -> int:
@@ -333,6 +346,10 @@ class DMM7461A(_StateMixin):
         self._jobs: queue.Queue = queue.Queue(maxsize=32)
         self._consecutive_timeouts = 0
         self._poll_last = {"F": 0.0, "R": 0.0, "PR": 0.0, "TRS": 0.0}
+        # 面板优先模式：保持 REN 撤销，让面板按键可用；命令发出后再自动退回本地
+        self._local_mode = False
+        self._last_local_sync = 0.0
+        self._host_state: dict = {}
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self):
@@ -358,16 +375,150 @@ class DMM7461A(_StateMixin):
             raise DeviceOffline("设备线程未启动")
         self._submit(self._force_reconnect_locked, timeout=6.0)
 
+    def _auto_local_locked(self):
+        """撤销 REN 并发送 GOTO_LOCAL，把仪器交回面板（不影响后续数据读取）。"""
+        if self._fd is None:
+            return
+        try:
+            _ren_control(self._fd, enable=False)
+        except (OSError, ValueError):
+            LOG.debug("撤销 REN 失败（可忽略）", exc_info=True)
+        try:
+            _goto_local_control(self._fd)
+        except (OSError, ValueError):
+            LOG.debug("GOTO_LOCAL 失败（可忽略）", exc_info=True)
+
+    def _local_maybe_sync(self):
+        """面板优先模式下低频率同步面板上的量程/速率/触发改动（10 秒一次）。"""
+        now = time.monotonic()
+        if now - self._last_local_sync < 10.0:
+            return
+        self._last_local_sync = now
+        before = self.snapshot()
+        fn = rg = rt = tr = None
+        try:
+            _ren_control(self._fd, enable=True)
+            fn = _function_from_reply(self._query_locked("F?", r"^F\d+", deadline=0.8))
+            rg = _range_from_reply(self._query_locked("R?", r"^R\d+", deadline=0.8))
+            rt = _rate_from_reply(self._query_locked("PR?", r"^PR\d+", deadline=0.8))
+            tr = _trigger_from_reply(self._query_locked("TRS?", r"^TRS\d+", deadline=0.8))
+        except QueryTimeout:
+            LOG.debug("面板设置同步超时（可忽略）")
+        finally:
+            self._auto_local_locked()
+        fields = {}
+        if fn and fn != before["function"]:
+            fields["function"] = fn
+        if rg and rg != before["range"]:
+            fields["range"] = rg
+        if rt and rt != before["rate"]:
+            fields["rate"] = rt
+        if tr and tr != before["trigger"]:
+            fields["trigger"] = tr
+        if fields:
+            self._apply_instrument(**fields)
+            self._publish_status()
+            LOG.info("面板设置同步：%s", fields)
+
+    def _enter_local_locked(self, message: str):
+        """进入本地面板模式：撤销 REN、GOTO_LOCAL，停止发送命令（worker 继续读数据）。"""
+        if self._fd is not None:
+            try:
+                _ren_control(self._fd, enable=False)
+            except (OSError, ValueError):
+                LOG.debug("撤销 REN 失败（可忽略）", exc_info=True)
+            try:
+                _goto_local_control(self._fd)
+            except (OSError, ValueError):
+                LOG.debug("GOTO_LOCAL 失败（可忽略）", exc_info=True)
+        self._local_mode = True
+        self._set_state("local", message)
+
+    def release_to_local(self):
+        """释放远程控制：撤销 REN、发送 GOTO_LOCAL，并暂停上位机命令发送。
+
+        停止发送命令后面板按键才能真正生效；否则轮询会立即把仪器重新拉回
+        远程状态。测量数据仍继续接收。
+        """
+        if not self._thread or not self._thread.is_alive():
+            raise DeviceOffline("设备线程未启动")
+        if self._fd is None:
+            raise DeviceOffline("设备未连接")
+        if self._local_mode:
+            return {"ok": True}
+        self._local_mode = True
+        # 丢弃尚未执行的远程命令，避免释放后又被拉回远程
+        while True:
+            try:
+                self._jobs.get_nowait()
+            except queue.Empty:
+                break
+
+        def job():
+            self._enter_local_locked("本地面板控制中（仅采集，不发送命令）")
+            return {"ok": True}
+
+        return self._submit(job, timeout=5.0, allow_local=True)
+
+    def resume_remote(self):
+        """恢复上位机控制：重新发送 REN 并同步仪器状态。"""
+        if not self._thread or not self._thread.is_alive():
+            raise DeviceOffline("设备线程未启动")
+        if self._fd is None:
+            raise DeviceOffline("设备未连接")
+        if not self._local_mode:
+            return self.sync_state()
+
+        def job():
+            status = _ren_with_retry(self._fd)
+            if status != USBTMC_STATUS_SUCCESS:
+                raise DeviceNotReady(f"REN_CONTROL 失败（状态 0x{status:02x}）")
+            self._local_mode = False
+            snap = self._sync_locked()
+            self._remember_host_state(snap)
+            self._set_state("online", "已恢复上位机控制")
+            return snap
+
+        return self._submit(job, timeout=8.0, allow_local=True)
+
     # -- 公共命令接口 ------------------------------------------------------
     def sync_state(self):
-        return self._submit(self._sync_locked)
+        result = self._submit(self._sync_locked)
+        self._remember_host_state(result)
+        return result
 
-    def send_command(self, text: str):
-        """发送一条设置/动作命令（无应答）。"""
+    def _remember_host_state(self, snap: dict | None = None):
+        snap = snap or self.snapshot()
+        self._host_state = {k: snap.get(k) for k in ("function", "range", "rate", "trigger")}
+
+    def send_command(self, text: str, host: bool = True):
+        """发送一条设置/动作命令（无应答）。host=False 用于模拟面板外部改动。"""
         text = text.strip()
         if not text:
             raise ValueError("空命令")
-        return self._submit(lambda: self._write(text + "\n"))
+        result = self._submit(lambda: self._write(text + "\n"))
+        if host:
+            self._update_host_state_from_command(text)
+        return result
+
+    def _update_host_state_from_command(self, text: str):
+        t = text.strip().upper()
+        if re.fullmatch(r"F\d+", t):
+            fn = _function_from_reply(t)
+            if fn:
+                self._host_state["function"] = fn
+        elif re.fullmatch(r"R\d+", t):
+            rg = _range_from_reply(t)
+            if rg:
+                self._host_state["range"] = rg
+        elif re.fullmatch(r"PR\d+", t):
+            rt = _rate_from_reply(t)
+            if rt:
+                self._host_state["rate"] = rt
+        elif re.fullmatch(r"TRS\d+", t):
+            tr = _trigger_from_reply(t)
+            if tr:
+                self._host_state["trigger"] = tr
 
     def query_command(self, text: str) -> str:
         """发送查询命令并返回原始应答。
@@ -396,28 +547,36 @@ class DMM7461A(_StateMixin):
         name = name.upper()
         if name not in FUNCTIONS:
             raise ValueError(f"不支持的功能: {name}")
-        return self._submit(lambda: self._set_function_locked(name))
+        result = self._submit(lambda: self._set_function_locked(name))
+        self._host_state["function"] = result["function"]
+        return result
 
     def set_range(self, code: str):
         code = code.upper()
         if code not in RANGES:
             raise ValueError(f"不支持的量程: {code}")
-        return self._submit(lambda: self._set_range_locked(code))
+        result = self._submit(lambda: self._set_range_locked(code))
+        self._host_state["range"] = result["range"]
+        return result
 
     def set_rate(self, code: str):
         code = code.upper()
         if code not in RATES:
             raise ValueError(f"不支持的采样率: {code}")
-        return self._submit(lambda: self._set_rate_locked(code))
+        result = self._submit(lambda: self._set_rate_locked(code))
+        self._host_state["rate"] = result["rate"]
+        return result
 
     def set_trigger(self, code: str):
         code = code.upper()
         if code not in TRIGGERS:
             raise ValueError(f"不支持的触发源: {code}")
-        return self._submit(lambda: self._set_trigger_locked(code))
+        result = self._submit(lambda: self._set_trigger_locked(code))
+        self._host_state["trigger"] = result["trigger"]
+        return result
 
     # -- 内部：fd / 通讯 ---------------------------------------------------
-    def _submit(self, fn, timeout: float = 5.0):
+    def _submit(self, fn, timeout: float = 5.0, allow_local: bool = False):
         if not self._thread or not self._thread.is_alive():
             raise DeviceOffline("设备线程未启动")
         if self._fd is None:
@@ -458,13 +617,18 @@ class DMM7461A(_StateMixin):
         self._fd = fd
         self._consecutive_timeouts = 0
         try:
-            self._sync_locked(sync_identity=True)
+            snap = self._sync_locked(sync_identity=True)
         except Exception:
             self._close_fd()
             raise
+        self._remember_host_state(snap)
         now = time.monotonic()
         self._poll_last = {k: now for k in self._poll_last}
-        self._set_state("online", "已连接")
+        # 面板优先：连接后立即撤销 REN，让面板按键可用；数据读取仍在继续
+        self._local_mode = True
+        self._auto_local_locked()
+        self._last_local_sync = now
+        self._set_state("online", "已连接（面板可用，自动释放远程）")
 
     def _dev_path(self) -> str:
         return self.snapshot()["device"]
@@ -535,31 +699,24 @@ class DMM7461A(_StateMixin):
                 self._poll_field(cmd, key)
                 return
 
+    _POLL_FIELDS = {
+        "F": ("function", r"^F\d+", _function_from_reply),
+        "R": ("range", r"^R\d+", _range_from_reply),
+        "PR": ("rate", r"^PR\d+", _rate_from_reply),
+        "TRS": ("trigger", r"^TRS\d+", _trigger_from_reply),
+    }
+
     def _poll_field(self, cmd: str, key: str):
         try:
+            name, pattern, parser = self._POLL_FIELDS[key]
             before = self.snapshot()
-            if key == "F":
-                fn = _function_from_reply(self._query_locked(cmd, r"^F\d+", deadline=0.8))
-                if fn and fn != before["function"]:
-                    self._apply_instrument(function=fn)
-            elif key == "R":
-                rg = _range_from_reply(self._query_locked(cmd, r"^R\d+", deadline=0.8))
-                if rg and rg != before["range"]:
-                    self._apply_instrument(range=rg)
-            elif key == "PR":
-                rt = _rate_from_reply(self._query_locked(cmd, r"^PR\d+", deadline=0.8))
-                if rt and rt != before["rate"]:
-                    self._apply_instrument(rate=rt)
-            elif key == "TRS":
-                tr = _trigger_from_reply(self._query_locked(cmd, r"^TRS\d+", deadline=0.8))
-                if tr and tr != before["trigger"]:
-                    self._apply_instrument(trigger=tr)
-            after = self.snapshot()
-            if (after["function"], after["range"], after["rate"], after["trigger"]) != \
-               (before["function"], before["range"], before["rate"], before["trigger"]):
-                LOG.info("检测到面板外部改动：%s %s %s %s",
-                         after["function"], after["range"], after["rate"], after["trigger"])
-                self._publish_status()
+            new_value = parser(self._query_locked(cmd, pattern, deadline=0.8))
+            if not new_value or new_value == before[name]:
+                return
+            # 面板/外部改动：直接同步到上位机，不释放控制
+            self._apply_instrument(**{name: new_value})
+            self._publish_status()
+            LOG.info("状态同步 %s: %s -> %s（面板/外部改动）", name, before[name], new_value)
         except QueryTimeout:
             LOG.debug("状态轮询超时: %s", cmd)
 
@@ -573,6 +730,16 @@ class DMM7461A(_StateMixin):
             "tag": tag,
             "raw": payload["raw"],
         }
+        # 本地面板模式下没有命令/轮询，只能靠数据表头同步功能与单位
+        if self._local_mode and tag and tag in FUNCTION_BY_TAG:
+            fn = FUNCTION_BY_TAG[tag]
+            with self._lock:
+                changed = self._state["function"] != fn
+                if changed:
+                    self._state["function"] = fn
+                    self._state["function_label"] = FUNCTIONS[fn][3]
+            if changed:
+                self._publish_status()
         self._emit_sample(sample)
 
     def _query_locked(self, cmd: str, pattern: str, deadline: float = QUERY_TIMEOUT_S,
@@ -601,6 +768,31 @@ class DMM7461A(_StateMixin):
         backoff = [0.5, 1.0, 2.0, 5.0, 10.0]
         idx = 0
         while not self._stop.is_set():
+            if self._local_mode:
+                # 面板优先模式：读数据；有命令时执行，执行完自动退回本地
+                try:
+                    job = self._jobs.get_nowait()
+                except queue.Empty:
+                    job = None
+                try:
+                    if job is not None:
+                        try:
+                            # 面板模式下撤销了 REN，执行上位机命令前需临时重新使能
+                            _ren_control(self._fd, enable=True)
+                            job()
+                        finally:
+                            self._auto_local_locked()
+                    else:
+                        self._local_maybe_sync()
+                        self._read_once()
+                except _Disconnected as exc:
+                    LOG.warning("面板模式 USB 断开: %s", exc)
+                    self._close_fd()
+                    self._local_mode = False
+                    self._set_state("offline", f"设备断开：{exc}")
+                except Exception:  # noqa: BLE001
+                    LOG.exception("面板模式循环异常")
+                continue
             if self._fd is None:
                 try:
                     self._open()
@@ -732,6 +924,7 @@ class SimulatedDMM(_StateMixin):
         self._thread = None
         self._stop = threading.Event()
         self._disconnected = False
+        self._local_mode = False
         self._ol = False
         self._adv: dict = {}
         self._apply_instrument(function="DCV", range="AUTO", rate="PR3", trigger="TRS0")
@@ -752,7 +945,12 @@ class SimulatedDMM(_StateMixin):
 
     def _run(self):
         t0 = time.monotonic()
-        while not self._stop.wait(0.05):
+        while True:
+            rate = self.snapshot().get("rate") or "PR3"
+            interval = {"PR1": 0.005, "PR2": 0.01, "PR3": 0.05,
+                        "PR4": 0.2, "PR5": 0.5}.get(rate, 0.05)
+            if self._stop.wait(interval):
+                break
             if self._disconnected:
                 continue
             t = time.monotonic() - t0
@@ -768,6 +966,24 @@ class SimulatedDMM(_StateMixin):
                 sample = {"t": time.time(), "mono": time.monotonic(), "v": value, "ol": False,
                           "tag": {"DCV": "DCV_"}.get(fn), "raw": f"{value:+.7E}"}
             self._emit_sample(sample)
+
+    def _ensure_remote(self):
+        if self._local_mode:
+            raise LocalMode("本地面板控制中，请先点击「恢复控制」")
+
+    def release_to_local(self):
+        if self._local_mode:
+            return {"ok": True}
+        self._local_mode = True
+        self._set_state("local", "本地面板控制中（模拟器，仅采集）")
+        return {"ok": True}
+
+    def resume_remote(self):
+        if not self._local_mode:
+            return self.snapshot()
+        self._local_mode = False
+        self._set_state("online", "已连接（模拟器）")
+        return self.snapshot()
 
     def sync_state(self):
         return self.snapshot()
@@ -791,7 +1007,8 @@ class SimulatedDMM(_StateMixin):
         "*STB?": "0", "*ESR?": "0",
     }
 
-    def send_command(self, text: str):
+    def send_command(self, text: str, host: bool = True):
+        self._ensure_remote()
         text = text.strip()
         if not text:
             raise ValueError("空命令")
@@ -808,10 +1025,12 @@ class SimulatedDMM(_StateMixin):
         return {"ok": True}
 
     def query_command(self, text: str) -> str:
+        self._ensure_remote()
         q = text.strip().upper()
         return self._adv.get(q, self._ADV_DEFAULTS.get(q, "OK"))
 
     def set_function(self, name: str):
+        self._ensure_remote()
         name = name.upper()
         if name not in FUNCTIONS:
             raise ValueError(f"不支持的功能: {name}")
@@ -820,6 +1039,7 @@ class SimulatedDMM(_StateMixin):
         return self.snapshot()
 
     def set_range(self, code: str):
+        self._ensure_remote()
         code = code.upper()
         if code not in RANGES:
             raise ValueError(f"不支持的量程: {code}")
@@ -828,6 +1048,7 @@ class SimulatedDMM(_StateMixin):
         return self.snapshot()
 
     def set_rate(self, code: str):
+        self._ensure_remote()
         code = code.upper()
         if code not in RATES:
             raise ValueError(f"不支持的采样率: {code}")
@@ -836,6 +1057,7 @@ class SimulatedDMM(_StateMixin):
         return self.snapshot()
 
     def set_trigger(self, code: str):
+        self._ensure_remote()
         code = code.upper()
         if code not in TRIGGERS:
             raise ValueError(f"不支持的触发源: {code}")

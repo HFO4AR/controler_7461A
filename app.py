@@ -439,6 +439,8 @@ class Hub:
         self.stats = Stats()
         self._rate_times = deque(maxlen=8192)
         self._ext_cache = None
+        self._pending_samples: list = []
+        self._last_sample_push = 0.0
         self.config = {"display_mode": "voltage", "shunt_ohm": 0.1}
         self.limits = {
             "voltage": {"enabled": False, "low": None, "high": None},
@@ -466,6 +468,7 @@ class Hub:
         self.samples.clear()
         self._rate_times.clear()
         self._ext_cache = None
+        self._pending_samples.clear()
         self.stats.reset(unit, self.context_id)
         LOG.info("测量上下文切换 #%s %s", self.context_id, reason)
 
@@ -484,6 +487,9 @@ class Hub:
             return self._ext_cache[1]
         vals = [s["d"] for s in self.samples
                 if s["ctx"] == self.context_id and s["d"] is not None and not s["ol"]]
+        # 限制排序规模，避免高速采样时周期性卡顿
+        if len(vals) > 10000:
+            vals = vals[-10000:]
         if vals:
             vals_sorted = sorted(vals)
             n = len(vals_sorted)
@@ -594,10 +600,14 @@ class Hub:
                     "raw": raw_sample.get("raw", ""),
                 })
 
-            self._broadcast_locked("sample", sample)
+            self._pending_samples.append(sample)
             now = time.time()
-            if now - self.last_stats_push >= 0.25:
+            # 低速批量推送（5Hz），优先保证主机流畅
+            if now - self._last_sample_push >= 0.2:
+                self._flush_samples_locked(now)
+            if now - self.last_stats_push >= 0.5:
                 self.last_stats_push = now
+                self._flush_samples_locked(now)
                 self._broadcast_locked("stats", self._stats_payload())
             if now - self.last_log_push >= 1.0:
                 self.last_log_push = now
@@ -716,6 +726,14 @@ class Hub:
                 self.clients.remove(q)
             except ValueError:
                 pass
+
+    def _flush_samples_locked(self, now: float | None = None):
+        if not self._pending_samples:
+            return
+        batch = self._pending_samples
+        self._pending_samples = []
+        self._last_sample_push = now or time.time()
+        self._broadcast_locked("samples", batch)
 
     def _broadcast_locked(self, event: str, data):
         for q in list(self.clients):
@@ -882,7 +900,12 @@ def api_stream():
                 except queue.Empty:
                     yield ": ping\n\n"
                     continue
-                event_id = data.get("seq") if event == "sample" and isinstance(data, dict) else None
+                if event == "samples" and isinstance(data, list) and data:
+                    event_id = data[-1].get("seq")
+                elif event == "sample" and isinstance(data, dict):
+                    event_id = data.get("seq")
+                else:
+                    event_id = None
                 yield _sse(event, data, event_id)
         except GeneratorExit:
             return
@@ -930,6 +953,8 @@ def api_control():
         return _api_error(str(exc), "timeout", 504)
     except dmm7461a.BusyError as exc:
         return _api_error(str(exc), "busy", 429)
+    except dmm7461a.LocalMode as exc:
+        return _api_error(str(exc), "local_mode", 409)
 
     return jsonify({"ok": True, "instrument": result,
                     "applied": {k: result.get(k) for k in ("function", "range", "rate", "trigger")}})
@@ -964,6 +989,8 @@ def api_config():
             return _api_error(str(exc), "timeout", 504)
         except dmm7461a.BusyError as exc:
             return _api_error(str(exc), "busy", 429)
+        except dmm7461a.LocalMode as exc:
+            return _api_error(str(exc), "local_mode", 409)
 
     state = h.set_config(display_mode=mode, shunt_ohm=float(shunt))
     if switching_mode:
@@ -1073,12 +1100,14 @@ def api_log_download(name):
 def api_reconnect():
     try:
         hub().dmm.force_reconnect()
-    except dmm7461a.DeviceOffline as exc:
-        return _api_error(str(exc), "offline", 503)
+    except (dmm7461a.DeviceOffline, dmm7461a.LocalMode) as exc:
+        return _dmm_http_error(exc)
     return jsonify({"ok": True})
 
 
 def _dmm_http_error(exc):
+    if isinstance(exc, dmm7461a.LocalMode):
+        return _api_error(str(exc), "local_mode", 409)
     if isinstance(exc, dmm7461a.DeviceOffline):
         return _api_error(str(exc), "offline", 503)
     if isinstance(exc, dmm7461a.QueryTimeout):
@@ -1216,7 +1245,8 @@ def api_dev_raw():
         return _api_error("缺少 command", "bad_request")
     cmd = cmd.strip()
     try:
-        hub().dmm.send_command(cmd)
+        # host=False：模拟面板按键造成的外部改动
+        hub().dmm.send_command(cmd, host=False)
     except (dmm7461a.DMMError, ValueError) as exc:
         return _dmm_http_error(exc)
     return jsonify({"ok": True, "sent": cmd})
