@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import csv
+import io
 import json
 import logging
 import math
@@ -522,6 +523,7 @@ class Hub:
         self._last_sample_push = 0.0
         self.config = {"display_mode": "voltage", "shunt_ohm": 0.1}
         self.cont_threshold = None   # 通断阈值（Ω），读/写 KOM 时更新
+        self.preset_released = False  # 上次退出时是否处于“完全释放”状态
         self.limits = {
             "voltage": {"enabled": False, "low": None, "high": None},
             "current": {"enabled": False, "low": None, "high": None},
@@ -746,6 +748,7 @@ class Hub:
                 "limits": json.loads(json.dumps(self.limits)),
                 "alarm": self.last_alarm,
                 "cont_threshold": self.cont_threshold,
+                "released": bool(self.dmm and getattr(self.dmm, "released", False)),
                 "logging": self.logger.state(),
                 "stats": self._stats_payload(),
                 "context_id": self.context_id,
@@ -843,7 +846,8 @@ class Hub:
     def _save_settings(self):
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            payload = {"config": self.config, "limits": self.limits}
+            payload = {"config": self.config, "limits": self.limits,
+                       "released": bool(self.dmm and getattr(self.dmm, "released", False))}
             tmp = SETTINGS_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, SETTINGS_FILE)
@@ -856,6 +860,7 @@ def _load_settings(hub: Hub):
         payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
+    hub.preset_released = bool(payload.get("released"))
     config = payload.get("config") or {}
     mode = config.get("display_mode")
     if mode in ("voltage", "current"):
@@ -905,6 +910,9 @@ def build(sim: bool | None = None) -> Flask:
     hub = Hub(sim=sim)
     _load_settings(hub)
     dmm = dmm7461a.create_dmm(sim=sim, on_sample=hub.on_sample, on_status=hub.on_status)
+    if hub.preset_released:
+        dmm.preset_released(True)
+        LOG.info("按上次设置保持释放状态：不控制仪器，只接收数据")
     hub.attach(dmm)
     _hub, _dmm = hub, dmm
     dmm.start()
@@ -1082,9 +1090,13 @@ def api_config():
     if not _valid_number(shunt) or not (SHUNT_MIN <= float(shunt) <= SHUNT_MAX):
         return _api_error(f"分流电阻必须在 {SHUNT_MIN:g} ~ {SHUNT_MAX:g} Ω 之间", "bad_value")
 
-    device_state = dmm.status_snapshot().get("state") if dmm else "offline"
+    snap = dmm.status_snapshot() if dmm else {}
+    device_state = snap.get("state", "offline")
     switching_mode = mode != h.config["display_mode"]
-    if mode == "current":
+    released = bool(getattr(dmm, "released", False))
+    if mode == "current" and released and snap.get("function") != "DCV":
+        return _api_error("已释放给仪器面板：请在面板切到 DCV，或先恢复控制", "local_mode", 409)
+    if mode == "current" and not (released and snap.get("function") == "DCV"):
         if device_state != "online":
             return _api_error("设备离线，无法进入分流电流模式", "offline", 503)
         try:
@@ -1137,7 +1149,7 @@ def api_stats_reset():
 @app.post("/api/log/start")
 def api_log_start():
     h = hub()
-    if h.dmm and h.dmm.status_snapshot().get("state") != "online":
+    if h.dmm and h.dmm.status_snapshot().get("state") not in ("online", "local"):
         return _api_error("设备离线，无法开始记录", "offline", 503)
     st = h.logger.start()
     h._broadcast("log", st)
@@ -1181,6 +1193,8 @@ def api_log_download(name):
     path = (LOG_DIR / name).resolve()
     if path.parent != LOG_DIR.resolve() or not path.is_file():
         return _api_error("文件不存在", "not_found", 404)
+    if request.args.get("start") or request.args.get("end"):
+        return _log_download_range(path, name)
     try:
         size = path.stat().st_size
     except OSError:
@@ -1202,6 +1216,287 @@ def api_log_download(name):
     })
 
 
+# ---------------------------------------------------------------------------
+# 记录分析 / 回放：解析 CSV（带缓存），按时间范围降采样并统计
+# ---------------------------------------------------------------------------
+_LOG_CACHE: dict = {}
+_LOG_CACHE_LOCK = threading.Lock()
+LOG_CACHE_MAX = 3
+ANALYSIS_MAX_POINTS = 20000
+
+
+class ParsedLog:
+    """一个 CSV 记录文件的列式数据（按 epoch 时间排序）。"""
+
+    def __init__(self, path: Path):
+        self.t: list = []
+        self.v: list = []          # 显示值；OL 或空值为 None
+        self.ol: list = []
+        self.alarm: list = []      # 0 正常 / 1 超限（low/high）
+        self.unit: list = []
+        self.fn: list = []
+        units: dict = {}
+        segments: list = []
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None) or []
+            idx = {name: i for i, name in enumerate(header)}
+            need = ("epoch_s", "display_value", "display_unit")
+            if any(k not in idx for k in need):
+                raise ValueError("不是本程序生成的记录文件（缺少必要列）")
+            i_t, i_v, i_u = idx["epoch_s"], idx["display_value"], idx["display_unit"]
+            i_ol, i_al = idx.get("is_ol"), idx.get("alarm_state")
+            i_fn, i_ctx = idx.get("function"), idx.get("context_id")
+            width = len(header)
+            last_key = None
+            for row in reader:
+                if len(row) < width:
+                    continue   # 正在写入的最后一行可能不完整
+                try:
+                    t = float(row[i_t])
+                except ValueError:
+                    continue
+                raw = row[i_v]
+                ol = (row[i_ol] == "1") if i_ol is not None else False
+                try:
+                    v = None if (ol or raw == "") else float(raw)
+                except ValueError:
+                    v = None
+                if v is not None and not math.isfinite(v):
+                    v = None
+                unit = row[i_u]
+                fn = row[i_fn] if i_fn is not None else ""
+                al = row[i_al] if i_al is not None else ""
+                self.t.append(t)
+                self.v.append(v)
+                self.ol.append(ol or v is None)
+                self.alarm.append(1 if al in ("low", "high") else 0)
+                self.unit.append(unit)
+                self.fn.append(fn)
+                units[unit] = units.get(unit, 0) + 1
+                key = (row[i_ctx] if i_ctx is not None else "", fn, unit)
+                if key != last_key:
+                    segments.append({"function": fn, "unit": unit, "start": t, "end": t, "rows": 0})
+                    last_key = key
+                segments[-1]["end"] = t
+                segments[-1]["rows"] += 1
+        self.units = units
+        self.segments = segments
+        self.rows = len(self.t)
+
+    def meta(self) -> dict:
+        start = self.t[0] if self.t else None
+        end = self.t[-1] if self.t else None
+        duration = (end - start) if self.t else 0.0
+        return {
+            "rows": self.rows,
+            "start": start,
+            "end": end,
+            "duration": duration,
+            "rate_hz": (self.rows - 1) / duration if duration > 0 else None,
+            "units": [{"unit": u, "rows": n} for u, n in
+                      sorted(self.units.items(), key=lambda kv: -kv[1])],
+            "segments": self.segments[:200],
+            "segments_total": len(self.segments),
+        }
+
+
+def _parsed_log(path: Path) -> ParsedLog:
+    st = path.stat()
+    key = str(path)
+    stamp = (st.st_size, st.st_mtime_ns)
+    with _LOG_CACHE_LOCK:
+        hit = _LOG_CACHE.get(key)
+        if hit and hit[0] == stamp:
+            hit[2] = time.monotonic()
+            return hit[1]
+    parsed = ParsedLog(path)
+    with _LOG_CACHE_LOCK:
+        _LOG_CACHE[key] = [stamp, parsed, time.monotonic()]
+        while len(_LOG_CACHE) > LOG_CACHE_MAX:
+            oldest = min(_LOG_CACHE, key=lambda k: _LOG_CACHE[k][2])
+            del _LOG_CACHE[oldest]
+    return parsed
+
+
+def _log_path(name: str):
+    if not LOG_NAME_RE.fullmatch(name or ""):
+        return None
+    path = (LOG_DIR / name).resolve()
+    if path.parent != LOG_DIR.resolve() or not path.is_file():
+        return None
+    return path
+
+
+def _range_stats(values: list, n_ol: int, n_alarm: int, t0, t1) -> dict:
+    n = len(values)
+    out = {"n": n, "n_ol": n_ol, "n_alarm": n_alarm,
+           "start": t0, "end": t1, "duration": (t1 - t0) if (t0 is not None and t1 is not None) else 0.0,
+           "mean": None, "std": None, "min": None, "max": None, "pp": None, "rms": None,
+           "median": None, "first": None, "last": None}
+    if not n:
+        return out
+    mean = math.fsum(values) / n
+    var = math.fsum((x - mean) ** 2 for x in values) / (n - 1) if n > 1 else 0.0
+    lo, hi = min(values), max(values)
+    srt = sorted(values) if n <= 2_000_000 else None
+    median = None
+    if srt is not None:
+        mid = n // 2
+        median = srt[mid] if n % 2 else (srt[mid - 1] + srt[mid]) / 2
+    out.update({
+        "mean": mean, "std": math.sqrt(var), "min": lo, "max": hi, "pp": hi - lo,
+        "rms": math.sqrt(math.fsum(x * x for x in values) / n),
+        "median": median, "first": values[0], "last": values[-1],
+    })
+    return out
+
+
+def analyze_log(parsed: ParsedLog, unit: str | None, start: float | None,
+                end: float | None, max_points: int) -> dict:
+    """返回 [start, end] 内指定单位的降采样数据（每桶 min/max/mean）和统计。"""
+    import bisect
+    t = parsed.t
+    if unit is None:
+        unit = max(parsed.units, key=parsed.units.get) if parsed.units else ""
+    lo_i = bisect.bisect_left(t, start) if start is not None else 0
+    hi_i = bisect.bisect_right(t, end) if end is not None else len(t)
+    if hi_i < lo_i:
+        hi_i = lo_i
+    idx = [i for i in range(lo_i, hi_i) if parsed.unit[i] == unit]
+
+    values = []
+    n_ol = n_alarm = 0
+    for i in idx:
+        if parsed.ol[i]:
+            n_ol += 1
+        else:
+            values.append(parsed.v[i])
+        n_alarm += parsed.alarm[i]
+    t0 = t[idx[0]] if idx else start
+    t1 = t[idx[-1]] if idx else end
+    stats = _range_stats(values, n_ol, n_alarm, t0, t1)
+
+    # 降采样：数量不多时原样返回；否则按时间等分桶，每桶保留 min/max/mean 与 OL/超限标记
+    points = []
+    raw = len(idx) <= max_points
+    if raw:
+        for i in idx:
+            v = parsed.v[i]
+            points.append([t[i], v, v, v, 1 if parsed.ol[i] else 0, parsed.alarm[i]])
+    elif idx:
+        span = (t1 - t0) or 1e-9
+        nb = max_points
+        buckets = [None] * nb
+        for i in idx:
+            b = min(nb - 1, int((t[i] - t0) / span * nb))
+            cur = buckets[b]
+            if cur is None:
+                cur = buckets[b] = [t[i], None, None, 0.0, 0, 0, 0]   # t,min,max,sum,n,ol,alarm
+            if parsed.ol[i]:
+                cur[5] = 1
+            else:
+                v = parsed.v[i]
+                cur[1] = v if cur[1] is None or v < cur[1] else cur[1]
+                cur[2] = v if cur[2] is None or v > cur[2] else cur[2]
+                cur[3] += v
+                cur[4] += 1
+            if parsed.alarm[i]:
+                cur[6] = 1
+        for cur in buckets:
+            if cur is None:
+                continue
+            mean = cur[3] / cur[4] if cur[4] else None
+            points.append([cur[0], cur[1], cur[2], mean, cur[5], cur[6]])
+    fns = sorted({parsed.fn[i] for i in idx[:: max(1, len(idx) // 500)]} if idx else set())
+    return {
+        "unit": unit,
+        "functions": fns,
+        "range": {"start": t0, "end": t1, "rows": len(idx)},
+        "raw": raw,
+        "columns": ["t", "min", "max", "mean", "ol", "alarm"],
+        "points": points,
+        "stats": stats,
+    }
+
+
+def _float_arg(name):
+    raw = request.args.get(name)
+    if raw in (None, ""):
+        return None
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(name)
+    return value
+
+
+@app.get("/api/logs/<name>/analysis")
+def api_log_analysis(name):
+    path = _log_path(name)
+    if path is None:
+        return _api_error("文件不存在", "not_found", 404)
+    try:
+        start, end = _float_arg("start"), _float_arg("end")
+        max_points = int(request.args.get("max_points", "2000"))
+    except ValueError:
+        return _api_error("参数无效", "bad_value")
+    max_points = max(10, min(ANALYSIS_MAX_POINTS, max_points))
+    try:
+        parsed = _parsed_log(path)
+    except (OSError, ValueError) as exc:
+        return _api_error(f"无法解析记录文件：{exc}", "bad_file", 422)
+    unit = request.args.get("unit")
+    if unit is not None and unit not in parsed.units:
+        return _api_error("文件中没有该单位的数据", "bad_value")
+    result = analyze_log(parsed, unit, start, end, max_points)
+    result.update({
+        "ok": True,
+        "name": name,
+        "active": hub().logger.active and hub().logger.file == name,
+        "meta": parsed.meta(),
+    })
+    return jsonify(result)
+
+
+def _log_download_range(path: Path, name: str):
+    """导出 [start, end] 时间范围内的行（按 epoch_s 过滤），保持原始列。"""
+    try:
+        start, end = _float_arg("start"), _float_arg("end")
+    except ValueError:
+        return _api_error("参数无效", "bad_value")
+
+    def gen():
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if not header:
+                return
+            i_t = header.index("epoch_s") if "epoch_s" in header else None
+            buf = io.StringIO()
+            writer = csv.writer(buf, lineterminator="\n")
+            writer.writerow(header)
+            for row in reader:
+                if i_t is None or len(row) <= i_t:
+                    continue
+                try:
+                    t = float(row[i_t])
+                except ValueError:
+                    continue
+                if (start is not None and t < start) or (end is not None and t > end):
+                    continue
+                writer.writerow(row)
+                if buf.tell() > 65536:
+                    yield buf.getvalue()
+                    buf.seek(0)
+                    buf.truncate()
+            yield buf.getvalue()
+
+    stem = name[:-4]
+    return Response(gen(), mimetype="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="{stem}_selection.csv"',
+    })
+
+
 @app.post("/api/device/reconnect")
 def api_reconnect():
     try:
@@ -1209,6 +1504,34 @@ def api_reconnect():
     except (dmm7461a.DeviceOffline, dmm7461a.LocalMode) as exc:
         return _dmm_http_error(exc)
     return jsonify({"ok": True})
+
+
+@app.post("/api/device/release")
+def api_release():
+    """完全释放控制：不再发送任何命令，仪器面板完全可用；数据仍被动接收。"""
+    h = hub()
+    try:
+        h.dmm.release_to_local()
+    except dmm7461a.DMMError as exc:
+        return _dmm_http_error(exc)
+    h._save_settings()
+    LOG.info("已完全释放控制给仪器面板")
+    h._broadcast("state", h.state())
+    return jsonify({"ok": True, "released": True, "state": h.state()})
+
+
+@app.post("/api/device/resume")
+def api_resume():
+    """恢复上位机控制：重新同步仪器状态，回到面板优先模式。"""
+    h = hub()
+    try:
+        h.dmm.resume_remote()
+    except dmm7461a.DMMError as exc:
+        return _dmm_http_error(exc)
+    h._save_settings()
+    LOG.info("已恢复上位机控制")
+    h._broadcast("state", h.state())
+    return jsonify({"ok": True, "released": False, "state": h.state()})
 
 
 def _dmm_http_error(exc):
@@ -1560,6 +1883,7 @@ def _agent_status() -> dict:
             "state": st["device"].get("state"),
             "message": st["device"].get("message"),
             "simulator": st["sim"],
+            "released": st["released"],
             "idn": st["instrument"].get("idn"),
         },
         "instrument": st["instrument"],
@@ -1599,12 +1923,17 @@ def api_agent_manifest():
             {"method": "POST", "path": "/api/log/start", "desc": "开始 CSV 记录"},
             {"method": "POST", "path": "/api/log/stop", "desc": "停止 CSV 记录"},
             {"method": "GET", "path": "/api/logs", "desc": "记录文件列表"},
-            {"method": "GET", "path": "/api/logs/<name>/download", "desc": "下载 CSV"},
+            {"method": "GET", "path": "/api/logs/<name>/download", "desc": "下载 CSV（可加 ?start=&end= 导出时间段）"},
+            {"method": "GET", "path": "/api/logs/<name>/analysis",
+             "desc": "记录分析：?unit=&start=&end=&max_points= 返回降采样曲线(min/max/mean)、统计与分段信息"},
             {"method": "GET", "path": "/api/advanced", "desc": "高级设置项清单"},
             {"method": "GET", "path": "/api/advanced/read", "desc": "读高级设置 ?keys=a,b"},
             {"method": "POST", "path": "/api/advanced/set", "desc": "写高级设置 {key, value}"},
             {"method": "POST", "path": "/api/advanced/action", "desc": "执行动作 {key}"},
             {"method": "POST", "path": "/api/device/reconnect", "desc": "强制重连"},
+            {"method": "POST", "path": "/api/device/release",
+             "desc": "完全释放控制给仪器面板（之后设置类接口返回 local_mode，数据仍可读取/记录）"},
+            {"method": "POST", "path": "/api/device/resume", "desc": "恢复上位机控制"},
         ],
         "options": META,
         "notes": [
@@ -1675,7 +2004,7 @@ def api_agent_measure():
         return _api_error(str(exc), "bad_value")
 
     h = hub()
-    if h.dmm and h.dmm.status_snapshot().get("state") != "online":
+    if h.dmm and h.dmm.status_snapshot().get("state") not in ("online", "local"):
         return _api_error("设备离线，无法测量", "offline", 503)
     if settle:
         time.sleep(settle)

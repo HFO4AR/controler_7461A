@@ -201,6 +201,29 @@ def t_log_read(args):
     }
 
 
+def t_log_analyze(args):
+    name = args.get("name")
+    if not name:
+        files = http("GET", "/api/logs").get("files", [])
+        if not files:
+            raise ApiError("还没有记录文件")
+        name = files[0]["name"]
+    q = {"unit": args.get("unit"), "start": args.get("start"), "end": args.get("end"),
+         "max_points": int(_num(args.get("max_points"), 200))}
+    d = http("GET", f"/api/logs/{urllib.parse.quote(name)}/analysis", query=q, timeout=120)
+    return {
+        "name": name,
+        "unit": d.get("unit"),
+        "functions": d.get("functions"),
+        "meta": d.get("meta"),
+        "range": d.get("range"),
+        "stats": d.get("stats"),
+        "downsampled": not d.get("raw"),
+        "columns": d.get("columns"),
+        "points": d.get("points"),
+    }
+
+
 def t_adv_read(args):
     keys = args.get("keys") or []
     if isinstance(keys, str):
@@ -220,6 +243,15 @@ def t_adv_action(args):
 
 def t_reconnect(_):
     return http("POST", "/api/device/reconnect")
+
+
+def t_panel(args):
+    action = args.get("action")
+    if action == "release":
+        return http("POST", "/api/device/release")
+    if action == "resume":
+        return http("POST", "/api/device/resume", timeout=20)
+    raise ApiError("action 只能是 release / resume")
 
 
 FUNCTION_CODES = ["DCV", "ACV", "RES2W", "RES4W", "DCI", "ACI", "ACV_DC", "ACI_DC",
@@ -336,6 +368,21 @@ TOOLS = [
         "fn": t_log_read,
     },
     {
+        "name": "dmm_log_analyze",
+        "description": "分析 CSV 记录文件（不给 name 则用最新文件）：返回文件概况（时长、行数、单位、功能分段）、"
+                       "指定时间段的统计（mean/std/min/max/pp/rms/median/OL/超限次数）和降采样曲线"
+                       "（每点 [t, min, max, mean, ol, alarm]）。start/end 为 epoch 秒；"
+                       "文件含多个单位时用 unit 选择。",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "unit": {"type": "string"},
+            "start": {"type": "number"},
+            "end": {"type": "number"},
+            "max_points": {"type": "integer", "default": 200, "minimum": 10, "maximum": 20000}}},
+        "annotations": {"readOnlyHint": True},
+        "fn": t_log_analyze,
+    },
+    {
         "name": "dmm_advanced_read",
         "description": "读取高级设置的仪器回读值，例如 keys=[\"digits\",\"itp\",\"azero\"]。",
         "inputSchema": {"type": "object", "required": ["keys"], "properties": {
@@ -358,6 +405,15 @@ TOOLS = [
             "key": {"type": "string"}}},
         "annotations": {"destructiveHint": True},
         "fn": t_adv_action,
+    },
+    {
+        "name": "dmm_panel_control",
+        "description": "release：完全释放控制给仪器面板（之后不发任何命令，只接收数据，记录/测量仍可用；"
+                       "设置类工具会返回 local_mode 错误）；resume：恢复上位机控制。"
+                       "用户正在手动操作面板时不要 resume。",
+        "inputSchema": {"type": "object", "required": ["action"], "properties": {
+            "action": {"type": "string", "enum": ["release", "resume"]}}},
+        "fn": t_panel,
     },
     {
         "name": "dmm_reconnect",

@@ -361,6 +361,16 @@ class DMM7461A(_StateMixin):
         self._local_mode = False
         self._last_local_sync = 0.0
         self._host_state: dict = {}
+        # 手动完全释放：不发任何命令、不使能 REN、不轮询，只被动接收仪器输出的数据
+        self._released = False
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def preset_released(self, released: bool = True):
+        """启动前设置（恢复上次的释放状态），避免启动时抢占面板。"""
+        self._released = bool(released)
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self):
@@ -384,7 +394,7 @@ class DMM7461A(_StateMixin):
         """请求 worker 关闭并重新打开设备。"""
         if not self._thread or not self._thread.is_alive():
             raise DeviceOffline("设备线程未启动")
-        self._submit(self._force_reconnect_locked, timeout=6.0)
+        self._submit(self._force_reconnect_locked, timeout=6.0, allow_local=True)
 
     def _auto_local_locked(self):
         """撤销 REN 并发送 GOTO_LOCAL，把仪器交回面板（不影响后续数据读取）。"""
@@ -463,49 +473,62 @@ class DMM7461A(_StateMixin):
         self._local_mode = True
         self._set_state("local", message)
 
-    def release_to_local(self):
-        """释放远程控制：撤销 REN、发送 GOTO_LOCAL，并暂停上位机命令发送。
+    RELEASED_MESSAGE = "已释放给仪器面板（只接收数据，不发送命令）"
 
-        停止发送命令后面板按键才能真正生效；否则轮询会立即把仪器重新拉回
-        远程状态。测量数据仍继续接收。
+    def release_to_local(self):
+        """完全释放控制：撤销 REN、发送 GOTO_LOCAL，此后不再发送任何命令或查询。
+
+        面板优先模式仍会定期临时使能 REN 来同步状态、执行网页命令；完全释放后
+        这些都停止，面板完全不受上位机影响。测量数据仍被动接收。
         """
         if not self._thread or not self._thread.is_alive():
             raise DeviceOffline("设备线程未启动")
-        if self._fd is None:
-            raise DeviceOffline("设备未连接")
-        if self._local_mode:
+        if self._released:
             return {"ok": True}
-        self._local_mode = True
-        # 丢弃尚未执行的远程命令，避免释放后又被拉回远程
+        self._released = True
+        # 丢弃尚未执行的命令，避免释放后又被拉回远程
         while True:
             try:
                 self._jobs.get_nowait()
             except queue.Empty:
                 break
+        if self._fd is None:
+            return {"ok": True}
 
         def job():
-            self._enter_local_locked("本地面板控制中（仅采集，不发送命令）")
+            self._enter_local_locked(self.RELEASED_MESSAGE)
             return {"ok": True}
 
         return self._submit(job, timeout=5.0, allow_local=True)
 
     def resume_remote(self):
-        """恢复上位机控制：重新发送 REN 并同步仪器状态。"""
+        """恢复上位机控制：重新使能 REN、同步状态，然后回到面板优先模式。"""
         if not self._thread or not self._thread.is_alive():
             raise DeviceOffline("设备线程未启动")
+        if not self._released:
+            return self.snapshot()
         if self._fd is None:
-            raise DeviceOffline("设备未连接")
-        if not self._local_mode:
-            return self.sync_state()
+            # 设备未连接：取消释放，worker 重新连接时按正常流程初始化
+            self._released = False
+            return self.snapshot()
 
         def job():
             status = _ren_with_retry(self._fd)
             if status != USBTMC_STATUS_SUCCESS:
                 raise DeviceNotReady(f"REN_CONTROL 失败（状态 0x{status:02x}）")
-            self._local_mode = False
-            snap = self._sync_locked()
+            try:
+                snap = self._sync_locked()
+            except Exception:
+                self._auto_local_locked()
+                raise
+            self._released = False
             self._remember_host_state(snap)
-            self._set_state("online", "已恢复上位机控制")
+            now = time.monotonic()
+            self._poll_last = {k: now for k in self._poll_last}
+            self._local_mode = True
+            self._auto_local_locked()
+            self._last_local_sync = now
+            self._set_state("online", "已恢复上位机控制（面板可用，自动释放远程）")
             return snap
 
         return self._submit(job, timeout=8.0, allow_local=True)
@@ -610,6 +633,8 @@ class DMM7461A(_StateMixin):
     def _submit(self, fn, timeout: float = 5.0, allow_local: bool = False):
         if not self._thread or not self._thread.is_alive():
             raise DeviceOffline("设备线程未启动")
+        if self._released and not allow_local:
+            raise LocalMode("已释放给仪器面板，请先点击「恢复控制」")
         if self._fd is None:
             raise DeviceOffline("设备未连接")
         evt = threading.Event()
@@ -660,6 +685,18 @@ class DMM7461A(_StateMixin):
         self._auto_local_locked()
         self._last_local_sync = now
         self._set_state("online", "已连接（面板可用，自动释放远程）")
+
+    def _open_passive(self):
+        """释放状态下打开设备：只确保仪器处于本地，不同步状态、不发命令。"""
+        self._set_state("connecting", "正在连接设备（保持面板控制）…")
+        fd = os.open(self._dev_path(), os.O_RDWR)
+        try:
+            fcntl.ioctl(fd, USBTMC_IOCTL_SET_TIMEOUT, struct.pack("I", READ_TIMEOUT_MS))
+        except OSError:
+            LOG.debug("SET_TIMEOUT 失败（可忽略）", exc_info=True)
+        self._fd = fd
+        self._consecutive_timeouts = 0
+        self._enter_local_locked(self.RELEASED_MESSAGE)
 
     def _dev_path(self) -> str:
         return self.snapshot()["device"]
@@ -799,6 +836,35 @@ class DMM7461A(_StateMixin):
         backoff = [0.5, 1.0, 2.0, 5.0, 10.0]
         idx = 0
         while not self._stop.is_set():
+            if self._released:
+                # 完全释放：只读数据；仅执行允许的作业（恢复控制/重连）
+                if self._fd is None:
+                    try:
+                        self._open_passive()
+                        idx = 0
+                    except Exception as exc:  # noqa: BLE001
+                        self._set_state("offline", f"设备未连接：{exc}")
+                        if self._stop.wait(backoff[min(idx, len(backoff) - 1)]):
+                            break
+                        idx += 1
+                    continue
+                try:
+                    try:
+                        job = self._jobs.get_nowait()
+                    except queue.Empty:
+                        job = None
+                    if job is not None:
+                        job()
+                    else:
+                        self._read_once()
+                except _Disconnected as exc:
+                    LOG.warning("释放状态 USB 断开: %s", exc)
+                    self._close_fd()
+                    self._set_state("offline", f"设备断开：{exc}")
+                except Exception:  # noqa: BLE001
+                    LOG.exception("释放状态循环异常")
+                    time.sleep(0.05)
+                continue
             if self._local_mode:
                 # 面板优先模式：读数据；有命令时执行，执行完自动退回本地
                 try:
@@ -978,7 +1044,10 @@ class SimulatedDMM(_StateMixin):
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._set_state("online", "已连接（模拟器）")
+        if self._local_mode:
+            self._set_state("local", "已释放给仪器面板（模拟器，只接收数据）")
+        else:
+            self._set_state("online", "已连接（模拟器）")
         self._thread = threading.Thread(target=self._run, name="dmm-sim", daemon=True)
         self._thread.start()
 
@@ -1022,11 +1091,18 @@ class SimulatedDMM(_StateMixin):
         if self._local_mode:
             raise LocalMode("本地面板控制中，请先点击「恢复控制」")
 
+    @property
+    def released(self) -> bool:
+        return self._local_mode
+
+    def preset_released(self, released: bool = True):
+        self._local_mode = bool(released)
+
     def release_to_local(self):
         if self._local_mode:
             return {"ok": True}
         self._local_mode = True
-        self._set_state("local", "本地面板控制中（模拟器，仅采集）")
+        self._set_state("local", "已释放给仪器面板（模拟器，只接收数据）")
         return {"ok": True}
 
     def resume_remote(self):
@@ -1126,7 +1202,10 @@ class SimulatedDMM(_StateMixin):
 
     def force_reconnect(self):
         self._disconnected = False
-        self._set_state("online", "已连接（模拟器）")
+        if self._local_mode:
+            self._set_state("local", "已释放给仪器面板（模拟器，只接收数据）")
+        else:
+            self._set_state("online", "已连接（模拟器）")
         return {"ok": True}
 
     # 模拟故障注入

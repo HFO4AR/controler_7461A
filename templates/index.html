@@ -25,6 +25,11 @@
       <span id="statusLed" class="led offline"></span>
       <span id="statusText">正在连接…</span>
     </div>
+    <button id="releaseBtn" class="btn btn-ghost btn-sm release-btn" title="完全释放控制给仪器面板 (P)" disabled>
+      <svg class="ico-release" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
+      <svg class="ico-resume" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      <span id="releaseText">释放控制</span>
+    </button>
     <div id="logIndicator" class="log-indicator hidden" title="正在记录 CSV">
       <span class="rec-dot"></span><span>REC</span><span id="logElapsedTop" class="rec-time">00:00</span>
     </div>
@@ -83,6 +88,14 @@
           <div class="scanbar" aria-hidden="true"></div>
         </div>
         <div id="alarmBanner" class="alarm-banner hidden"></div>
+        <div id="releaseBanner" class="release-banner hidden">
+          <span class="release-icon" aria-hidden="true">⌂</span>
+          <div class="release-copy">
+            <b>仪器面板控制中</b>
+            <span>网页不发送任何命令，只接收数据（可继续记录）。面板上的量程/速率等改动在恢复控制后同步。</span>
+          </div>
+          <button id="resumeBtn" class="btn btn-primary btn-sm">恢复控制</button>
+        </div>
 
         <div class="sub-readouts" id="subReadouts">
           <div class="sub"><label>MIN</label><b id="subMin">—</b></div>
@@ -389,6 +402,86 @@
 </div>
 
 <!-- 快捷键 -->
+<!-- 记录分析 / 回放 -->
+<div id="replayLayer" class="modal-layer replay-layer hidden">
+  <div class="replay" role="dialog" aria-modal="true" aria-labelledby="replayTitle">
+    <div class="replay-head">
+      <div class="replay-title-wrap">
+        <span class="page-kicker">记录分析 · 回放</span>
+        <h2 id="replayTitle">—</h2>
+        <p id="replayMeta" class="replay-meta">—</p>
+      </div>
+      <div class="replay-head-actions">
+        <button id="rpReload" class="btn btn-ghost btn-sm" title="重新读取文件（记录中的文件会追加新数据）">刷新</button>
+        <a id="rpDownload" class="btn btn-ghost btn-sm" href="#" download>下载</a>
+        <button id="rpClose" class="icon-btn" aria-label="关闭回放" title="关闭 (Esc)">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+    <div id="rpUnits" class="chip-row rp-units hidden" role="group" aria-label="数据单位"></div>
+    <div class="replay-body">
+      <div class="replay-side">
+        <div class="display rp-display" id="rpDisplay">
+          <div class="annunciators">
+            <span class="ann on" id="rpFn">—</span>
+            <span class="ann" id="rpApprox" title="当前缩放下为区间平均值">AVG</span>
+            <span class="ann ann-bad" id="rpOl">OL</span>
+            <span class="ann ann-bad" id="rpAlm">ALM</span>
+            <span class="ann-spacer"></span>
+            <span class="ann ann-rate" id="rpSpeedAnn">1×</span>
+          </div>
+          <div class="value-line rp-value-line">
+            <span id="rpValue" class="value">--</span>
+            <span id="rpUnit" class="unit">V</span>
+          </div>
+          <div class="display-state" id="rpTime">—</div>
+        </div>
+        <div class="rp-stats-head">
+          <span id="rpStatsTitle">全部数据</span>
+          <button id="rpExport" class="btn btn-ghost btn-sm" title="把当前选区（无选区时为可见范围）导出为 CSV">导出该段</button>
+        </div>
+        <div id="rpStats" class="rp-stats"></div>
+      </div>
+      <div class="replay-main">
+        <div class="rp-toolbar">
+          <div class="seg" id="rpMode" role="group" aria-label="鼠标操作">
+            <button data-mode="pan" class="active" title="拖动平移，单击定位播放位置">平移</button>
+            <button data-mode="select" title="拖动框选一段做统计（也可按住 Shift 拖动）">选区</button>
+          </div>
+          <button id="rpFit" class="btn btn-ghost btn-sm" title="显示全部 (0)">全部</button>
+          <button id="rpZoomSel" class="btn btn-ghost btn-sm" disabled title="放大到选区">放大选区</button>
+          <button id="rpClearSel" class="btn btn-ghost btn-sm" disabled>清除选区</button>
+          <span class="flex-spacer"></span>
+          <span class="hint-inline rp-hint">滚轮缩放 · 拖动平移 · Shift+拖动选区 · 空格播放</span>
+        </div>
+        <div class="rp-chart-wrap" id="rpChartWrap">
+          <canvas id="rpChart" tabindex="0" aria-label="记录曲线"></canvas>
+          <div id="rpLoading" class="rp-loading hidden"><span class="spinner"></span>读取中…</div>
+          <div id="rpTip" class="chart-tip hidden"></div>
+        </div>
+        <div class="rp-nav-wrap"><canvas id="rpNav" aria-label="全局导航"></canvas></div>
+        <div class="rp-transport">
+          <button id="rpPlay" class="btn btn-primary btn-sm rp-play" title="播放 / 暂停 (空格)">
+            <svg class="ico-play" viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
+            <svg class="ico-pause" viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+            <span id="rpPlayText">播放</span>
+          </button>
+          <div class="seg" id="rpSpeed" role="group" aria-label="回放速度">
+            <button data-speed="1" class="active">1×</button>
+            <button data-speed="5">5×</button>
+            <button data-speed="20">20×</button>
+            <button data-speed="100">100×</button>
+            <button data-speed="500">500×</button>
+          </div>
+          <input type="range" id="rpScrub" min="0" max="10000" value="0" step="1" aria-label="回放位置">
+          <span id="rpClock" class="rp-clock">00:00 / 00:00</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="helpLayer" class="modal-layer hidden">
   <div class="modal modal-help" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
     <h3 id="helpTitle">快捷键</h3>
@@ -400,6 +493,7 @@
       <dt><kbd>T</kbd></dt><dd>曲线 / 表格切换</dd>
       <dt><kbd>R</kbd></dt><dd>重置统计</dd>
       <dt><kbd>A</kbd></dt><dd>打开高级设置</dd>
+      <dt><kbd>P</kbd></dt><dd>释放控制给面板 / 恢复控制</dd>
       <dt><kbd>Enter</kbd></dt><dd>在输入框中直接应用</dd>
       <dt><kbd>Esc</kbd></dt><dd>关闭弹层 / 抽屉</dd>
       <dt><kbd>← →</kbd></dt><dd>趋势图聚焦时逐点查看</dd>

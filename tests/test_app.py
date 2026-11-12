@@ -196,8 +196,14 @@ class AppTests(unittest.TestCase):
         self.assertTrue(body["value"].startswith("KNL"))
 
     def test_stats_rate_hz(self):
-        time.sleep(0.3)
-        st = self.json(self.client.get("/api/state"))["stats"]
+        # 前面的测试可能刚重置统计、且模拟器处于慢速档，轮询等待最多 2 s
+        deadline = time.time() + 2.0
+        st = {}
+        while time.time() < deadline:
+            st = self.json(self.client.get("/api/state"))["stats"]
+            if st.get("rate_hz", 0) > 0:
+                break
+            time.sleep(0.1)
         self.assertGreater(st.get("rate_hz", 0), 0)
 
     def test_units_follow_function_and_shunt(self):
@@ -383,6 +389,94 @@ class AppTests(unittest.TestCase):
                 "/api/agent/setup", json={"cont_threshold": bad}).status_code, 400)
         r = self.client.post("/api/agent/setup", json={"function": "DCV", "cont_threshold": 10})
         self.assertEqual(r.status_code, 400)
+
+    # -- 完全释放控制 ------------------------------------------------------------
+    def test_release_and_resume(self):
+        self.client.post("/api/agent/setup", json={"function": "DCV"})
+        r = self.client.post("/api/device/release")
+        self.assertEqual(r.status_code, 200)
+        st = self.json(self.client.get("/api/state"))
+        self.assertTrue(st["released"])
+        self.assertEqual(st["device"]["state"], "local")
+        import json as _json
+        self.assertTrue(_json.loads(appmod.SETTINGS_FILE.read_text())["released"])
+        # 仪器命令被拒绝
+        r = self.client.post("/api/control", json={"action": "rate", "value": "PR3"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["code"], "local_mode")
+        # 数据仍在：可以测量、记录、改上位机侧限值
+        r = self.client.post("/api/agent/measure", json={"count": 3})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(self.client.post("/api/log/start").status_code, 200)
+        self.client.post("/api/log/stop")
+        r = self.client.post("/api/limits", json={"mode": "voltage", "enabled": False})
+        self.assertEqual(r.status_code, 200)
+        # DCV 下可进入分流模式（不需要发命令）
+        r = self.client.post("/api/config", json={"display_mode": "current", "shunt_ohm": 0.1})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.client.post("/api/config", json={"display_mode": "voltage", "shunt_ohm": 0.1})
+        # 恢复
+        r = self.client.post("/api/device/resume")
+        self.assertEqual(r.status_code, 200)
+        st = self.json(self.client.get("/api/state"))
+        self.assertFalse(st["released"])
+        self.assertEqual(st["device"]["state"], "online")
+        self.assertEqual(self.client.post(
+            "/api/control", json={"action": "rate", "value": "PR3"}).status_code, 200)
+        self.assertFalse(_json.loads(appmod.SETTINGS_FILE.read_text())["released"])
+
+    # -- 记录分析 / 回放 ---------------------------------------------------------
+    def test_log_analysis(self):
+        name = "7461A_20260101_000000.csv"
+        path = appmod.LOG_DIR / name
+        rows = [",".join(appmod.CSV_FIELDS)]
+        t0 = 1_700_000_000.0
+        for i in range(3000):
+            ol = 1 if i % 500 == 7 else 0
+            v = "" if ol else f"{0.01 + 0.001 * (i % 10):.12g}"
+            unit, fn = ("V", "DCV") if i < 2500 else ("Ω", "RES2W")
+            alarm = "high" if i == 100 else "off"
+            rows.append(f"x,{t0 + i * 0.1:.6f},{i * 0.1:.3f},{i},1,{fn},{unit},AUTO,PR3,"
+                        f"{v},,{v},{unit},{ol},0.1,voltage,{alarm},raw")
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        d = self.json(self.client.get(f"/api/logs/{name}/analysis?max_points=200"))
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["unit"], "V")                     # 行数最多的单位
+        self.assertEqual(d["meta"]["rows"], 3000)
+        self.assertEqual([u["unit"] for u in d["meta"]["units"]], ["V", "Ω"])
+        self.assertEqual(len(d["meta"]["segments"]), 2)
+        self.assertFalse(d["raw"])
+        self.assertLessEqual(len(d["points"]), 200)
+        st = d["stats"]
+        self.assertEqual(st["n"] + st["n_ol"], 2500)
+        self.assertEqual(st["n_ol"], 5)
+        self.assertEqual(st["n_alarm"], 1)
+        self.assertAlmostEqual(st["min"], 0.01)
+        self.assertAlmostEqual(st["max"], 0.019)
+        # 桶保留极值
+        self.assertAlmostEqual(min(p[1] for p in d["points"] if p[1] is not None), 0.01)
+        # 时间范围 + 原始点
+        d = self.json(self.client.get(
+            f"/api/logs/{name}/analysis?start={t0 + 10}&end={t0 + 20}&max_points=500"))
+        self.assertTrue(d["raw"])
+        self.assertEqual(d["range"]["rows"], 101)
+        self.assertEqual(len(d["points"]), 101)
+        # 另一个单位
+        d = self.json(self.client.get(f"/api/logs/{name}/analysis?unit=%CE%A9"))
+        self.assertEqual(d["stats"]["n"] + d["stats"]["n_ol"], 500)
+        self.assertEqual(d["functions"], ["RES2W"])
+        # 错误参数
+        self.assertEqual(self.client.get(f"/api/logs/{name}/analysis?unit=Hz").status_code, 400)
+        self.assertEqual(self.client.get(f"/api/logs/{name}/analysis?start=abc").status_code, 400)
+        self.assertEqual(self.client.get("/api/logs/../x.csv/analysis").status_code, 404)
+        # 导出时间段
+        r = self.client.get(f"/api/logs/{name}/download?start={t0 + 10}&end={t0 + 20}")
+        self.assertEqual(r.status_code, 200)
+        lines = r.get_data(as_text=True).strip().split("\n")
+        self.assertEqual(lines[0], ",".join(appmod.CSV_FIELDS))
+        self.assertEqual(len(lines), 102)
+        self.assertIn("selection", r.headers["Content-Disposition"])
+        path.unlink()
 
 
 if __name__ == "__main__":

@@ -53,6 +53,8 @@ env = { DMM_URL = "http://127.0.0.1:7461" }
 | `dmm_reset_stats` | 重置累计统计 |
 | `dmm_log` | CSV 记录：start / stop / list |
 | `dmm_log_read` | 读 CSV 记录文件的最后若干行 |
+| `dmm_log_analyze` | 分析记录文件：概况、时间段统计、降采样曲线 |
+| `dmm_panel_control` | `release` 完全释放控制给仪器面板 / `resume` 恢复控制 |
 | `dmm_advanced_read` / `dmm_advanced_set` / `dmm_advanced_action` | 高级设置（积分时间、显示位数、自动调零、触发参数等） |
 | `dmm_reconnect` | 强制重连仪器 |
 
@@ -117,6 +119,18 @@ agent 可以直接这样用：「把万用表切到四线电阻，等 1 秒，�
 - `/api/advanced`、`/api/advanced/read`、`/api/advanced/set`、`/api/advanced/action`
 - `/api/device/reconnect`
 - `/api/stream`（SSE 实时推送）
+
+### 记录分析
+
+`GET /api/logs/<name>/analysis?unit=&start=&end=&max_points=2000`
+
+- `start`、`end` 为 epoch 秒，可省略。文件含多个单位时用 `unit` 选择，默认取行数最多的单位。
+- 返回 `meta`（行数、时长、单位、功能分段）、`stats`（该时间段的统计）和 `points`（降采样曲线，每点 `[t, min, max, mean, ol, alarm]`，降采样时保留每段的极值）。
+- `GET /api/logs/<name>/download?start=&end=` 只导出该时间段的原始行。
+
+### 完全释放控制
+
+`POST /api/device/release` 把仪器完全交给面板：上位机不再发送任何命令和查询，只被动接收测量数据，记录、测量、统计照常可用。此时设置类接口返回 409 `local_mode`。`POST /api/device/resume` 恢复控制。释放状态会保存，服务重启后仍保持释放。
 
 ### curl 示例
 

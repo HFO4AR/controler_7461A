@@ -274,6 +274,14 @@
   function isOnline() {
     return (state.device.state || 'offline') === 'online';
   }
+  // 有数据流：在线或已释放给面板（仍被动接收数据）
+  function hasData() {
+    const st = state.device.state || 'offline';
+    return st === 'online' || st === 'local';
+  }
+  function isReleased() {
+    return !!state.released || (state.device.state || '') === 'local';
+  }
 
   // 自定义确认框，替代 window.confirm
   function confirmDialog(text, { title = '确认操作', ok = '确认执行' } = {}) {
@@ -386,7 +394,8 @@
       : (state.sim ? '模拟器' : ''));
 
     const offline = st !== 'online';
-    $('readout').classList.toggle('offline', offline);
+    $('readout').classList.toggle('offline', !hasData() || !state.serverOnline);
+    renderRelease();
     for (const id of ['rangeSelect', 'rateSelect', 'triggerSelect']) {
       const el = $(id);
       if (el && !el.classList.contains('pending')) el.disabled = offline || state.switching;
@@ -630,7 +639,10 @@
     // 显示屏状态行
     let stateText = '';
     readout.classList.remove('stale');
-    if (!isOnline()) {
+    if (state.serverOnline && isReleased() && hasData() && !state.hold) {
+      stateText = '面板控制中 · 只接收数据'
+        + (s && s.t ? ' · ' + timeStr(s.t) : '');
+    } else if (!isOnline() && !(hasData() && state.serverOnline)) {
       stateText = state.serverOnline ? '设备未连接 · 等待重连' : '服务器未连接';
     } else if (state.switching) {
       stateText = '切换中…';
@@ -1253,6 +1265,55 @@
     if (b) applyContThreshold(b.dataset.v);
   });
 
+  // ---- 完全释放控制 ----------------------------------------------------
+  function renderRelease() {
+    const released = isReleased() && state.serverOnline;
+    const btn = $('releaseBtn');
+    btn.classList.toggle('is-released', released);
+    setText('releaseText', released ? '恢复控制' : '释放控制');
+    btn.title = released ? '恢复上位机控制 (P)' : '完全释放控制给仪器面板 (P)';
+    if (!btn.classList.contains('is-busy')) {
+      btn.disabled = !state.serverOnline || !(released || isOnline());
+    }
+    $('releaseBanner').classList.toggle('hidden', !released);
+    document.body.classList.toggle('is-released', released);
+    if (released) {
+      // 仪器命令全部锁定；分流电阻与限值报警只在上位机计算，仍可修改
+      $('controlHint').textContent = '已释放给仪器面板，点「恢复控制」后才能在网页上设置仪器。';
+      for (const id of ['contApply', 'contValue']) {
+        const el = $(id);
+        if (el && !el.classList.contains('is-busy')) el.disabled = true;
+      }
+      for (const b of $('contPresets').querySelectorAll('button')) b.disabled = true;
+      for (const el of $('fnAdvList').querySelectorAll('select, input, button')) el.disabled = true;
+    } else {
+      for (const el of $('fnAdvList').querySelectorAll('select, input, button')) {
+        if (!el.classList.contains('pending')) el.disabled = !isOnline();
+      }
+    }
+  }
+
+  async function toggleRelease() {
+    if (!state.serverOnline) return;
+    const btn = $('releaseBtn');
+    const releasing = !isReleased();
+    if (releasing && !isOnline()) { showToast('设备未连接', 'error'); return; }
+    await withBusy(btn, async () => {
+      try {
+        const d = await postJSON(releasing ? '/api/device/release' : '/api/device/resume', {});
+        if (d.state) applyState(d.state);
+        showToast(releasing ? '已释放给仪器面板，网页只接收数据' : '已恢复上位机控制', 'ok');
+        if (!releasing) { loadIntegrationTime(); state.layoutKey = undefined; applyFunctionLayout(true); }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+    renderRelease();
+  }
+
+  $('releaseBtn').addEventListener('click', toggleRelease);
+  $('resumeBtn').addEventListener('click', toggleRelease);
+
   function renderConfigUI() {
     const mode = state.config.display_mode;
     for (const btn of $('modeGroup').querySelectorAll('button')) {
@@ -1389,6 +1450,7 @@
     if (d.config) state.config = d.config;
     if (d.limits) state.limits = d.limits;
     if (d.null) state.null = d.null;
+    if (typeof d.released === 'boolean') state.released = d.released;
     if (d.cont_threshold !== undefined && d.cont_threshold !== null) state.contThreshold = d.cont_threshold;
     if (typeof d.alarm === 'string' && !state.switching) state.alarm = d.alarm;
     if (d.logging) state.logging = d.logging;
@@ -2329,7 +2391,16 @@
         a.href = `/api/logs/${encodeURIComponent(f.name)}/download`;
         a.textContent = '下载';
         a.setAttribute('download', f.name);
-        div.append(name, meta, a);
+        const an = document.createElement('button');
+        an.type = 'button';
+        an.className = 'log-analyze';
+        an.textContent = '分析';
+        an.title = '分析 / 回放这个记录';
+        an.addEventListener('click', () => openReplay(f.name));
+        const acts = document.createElement('span');
+        acts.className = 'log-actions';
+        acts.append(an, a);
+        div.append(name, meta, acts);
         list.appendChild(div);
       }
       if (manual) showToast(`共 ${d.files.length} 个记录文件`);
@@ -2791,12 +2862,804 @@
       case 't': setView(state.tableOpen ? 'chart' : 'table'); break;
       case 'r': resetStats(); break;
       case 'a': advOpen(); break;
+      case 'p': toggleRelease(); break;
       case '+': case '=': zoomBy(1 / 1.6); break;
       case '-': case '_': zoomBy(1.6); break;
       default: return;
     }
     e.preventDefault();
   });
+
+  // ------------------------------------------------------------------
+  // 记录分析 / 回放
+  // ------------------------------------------------------------------
+  const rp = {
+    open: false, name: null, unit: null, meta: null,
+    full: null,        // 整个文件的概览数据（导航条用）
+    data: null,        // 当前视图附近的细节数据
+    view: { start: 0, end: 1 },
+    sel: null,         // { start, end }
+    cursor: 0, playing: false, speed: 1, lastFrame: 0,
+    mode: 'pan', drag: null, hover: null,
+    dirty: true, detailSeq: 0, statsSeq: 0, detailTimer: 0, statsTimer: 0,
+    loading: 0, colors: null, colorsKey: '', raf: 0,
+  };
+
+  // 横轴范围：当前单位数据的起止；时间标注统一以文件开头为原点
+  function rpExtent() {
+    const r = rp.full && rp.full.range;
+    if (r && r.start !== null && r.start !== undefined) return { start: r.start, end: Math.max(r.end, r.start + 1e-3) };
+    const m = rp.meta;
+    return m && m.start !== null ? { start: m.start, end: Math.max(m.end, m.start + 1e-3) } : { start: 0, end: 1 };
+  }
+  function rpOrigin() {
+    return rp.meta && rp.meta.start !== null ? rp.meta.start : rpExtent().start;
+  }
+
+  function fmtElapsed(sec, step = 1) {
+    const neg = sec < 0;
+    sec = Math.abs(sec);
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const dec = step < 0.1 ? 2 : step < 1 ? 1 : 0;
+    const ss = dec ? s.toFixed(dec).padStart(3 + dec, '0') : String(Math.floor(s)).padStart(2, '0');
+    return (neg ? '-' : '') + (h ? h + ':' + String(m).padStart(2, '0') : String(m).padStart(2, '0')) + ':' + ss;
+  }
+
+  function fmtDur(sec) {
+    if (!Number.isFinite(sec)) return '—';
+    if (sec < 1) return (sec * 1000).toFixed(0) + ' ms';
+    if (sec < 60) return sec.toFixed(sec < 10 ? 2 : 1) + ' s';
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+    return h ? `${h} h ${m} min` : `${m} min ${s} s`;
+  }
+
+  function fmtWall(t) {
+    const d = new Date(t * 1000);
+    return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) + ' '
+      + d.toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  }
+
+  function rpColors() {
+    const key = state.theme;
+    if (rp.colors && rp.colorsKey === key) return rp.colors;
+    rp.colorsKey = key;
+    rp.colors = {
+      ink: cssVar('--ink-2'), muted: cssVar('--muted'), grid: cssVar('--grid'), axis: cssVar('--axis'),
+      accent: cssVar('--accent'), bad: cssVar('--bad'), warn: cssVar('--warn'), panel: cssVar('--panel-2'),
+    };
+    return rp.colors;
+  }
+
+  function rpSetLoading(delta) {
+    rp.loading = Math.max(0, rp.loading + delta);
+    $('rpLoading').classList.toggle('hidden', rp.loading === 0);
+  }
+
+  async function rpFetch(params) {
+    const q = new URLSearchParams();
+    if (rp.unit) q.set('unit', rp.unit);
+    for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) q.set(k, v);
+    return api(`/api/logs/${encodeURIComponent(rp.name)}/analysis?` + q.toString());
+  }
+
+  async function openReplay(name) {
+    rp.name = name;
+    rp.unit = null;
+    rp.sel = null;
+    rp.playing = false;
+    rp.open = true;
+    rp.full = rp.data = rp.meta = null;
+    setText('replayTitle', name);
+    setText('replayMeta', '读取中…');
+    $('rpDownload').href = `/api/logs/${encodeURIComponent(name)}/download`;
+    $('rpDownload').setAttribute('download', name);
+    $('replayLayer').classList.remove('hidden');
+    rpRenderPlay();
+    rpRenderStats(null);
+    if (!rp.raf) rp.raf = requestAnimationFrame(rpTick);
+    await rpLoadFull(true);
+    setTimeout(() => $('rpChart').focus(), 50);
+  }
+
+  function closeReplay() {
+    rp.open = false;
+    rp.playing = false;
+    $('replayLayer').classList.add('hidden');
+    $('rpTip').classList.add('hidden');
+  }
+
+  async function rpLoadFull(resetView) {
+    rpSetLoading(1);
+    try {
+      const d = await rpFetch({ max_points: 1600 });
+      rp.full = d;
+      rp.meta = d.meta;
+      rp.unit = d.unit;
+      rp.active = d.active;
+      rpRenderMeta();
+      rpRenderUnits();
+      const ext = rpExtent();
+      if (resetView || !rp.data) {
+        rp.view = { ...ext };
+        rp.cursor = (d.range && d.range.start) || ext.start;
+        rp.data = d;
+      } else {
+        rpScheduleDetail(0);
+      }
+      rpRenderStats(d.stats, rp.sel ? null : '全部数据');
+      if (rp.sel) rpScheduleStats(0);
+      rp.dirty = true;
+    } catch (err) {
+      setText('replayMeta', '读取失败：' + err.message);
+      showToast(err.message, 'error');
+    } finally {
+      rpSetLoading(-1);
+    }
+  }
+
+  function rpRenderMeta() {
+    const m = rp.meta;
+    if (!m || !m.rows) { setText('replayMeta', '文件中没有数据'); return; }
+    const rate = m.rate_hz ? ` · 平均 ${m.rate_hz >= 10 ? m.rate_hz.toFixed(1) : m.rate_hz.toFixed(2)} S/s` : '';
+    const fns = (rp.full && rp.full.functions || []).map(funcLabel).join(' / ');
+    setText('replayMeta', `${fmtWall(m.start).slice(0, -4)} 起 · 时长 ${fmtDur(m.duration)} · ${m.rows.toLocaleString()} 行${rate}`
+      + (fns ? ' · ' + fns : '') + (rp.active ? ' · 记录中' : ''));
+  }
+
+  function rpRenderUnits() {
+    const box = $('rpUnits');
+    const units = (rp.meta && rp.meta.units) || [];
+    box.classList.toggle('hidden', units.length < 2);
+    box.innerHTML = '';
+    for (const u of units) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = `${u.unit || '—'} · ${u.rows.toLocaleString()} 行`;
+      b.classList.toggle('active', u.unit === rp.unit);
+      b.addEventListener('click', () => {
+        if (u.unit === rp.unit) return;
+        rp.unit = u.unit;
+        rp.sel = null;
+        rp.playing = false;
+        rpRenderPlay();
+        rpLoadFull(true);
+      });
+      box.appendChild(b);
+    }
+  }
+
+  // 视图变化后按需加载更细的数据（带前后余量，播放时不必频繁请求）
+  function rpScheduleDetail(delay = 120) {
+    clearTimeout(rp.detailTimer);
+    rp.detailTimer = setTimeout(rpLoadDetail, delay);
+  }
+
+  function rpDetailOk() {
+    const d = rp.data;
+    if (!d || !d.range || d.range.start === null) return false;
+    const { start, end } = rp.view;
+    const ext = rpExtent();
+    const covers = d.range.start <= Math.max(start, ext.start) + 1e-9 && d.range.end >= Math.min(end, ext.end) - 1e-9;
+    if (!covers) return false;
+    if (d.raw) return true;
+    const span = d.range.end - d.range.start;
+    const width = $('rpChart').clientWidth || 800;
+    return (end - start) / span * d.points.length >= width * 0.9;
+  }
+
+  async function rpLoadDetail() {
+    if (!rp.open || !rp.name || rpDetailOk()) return;
+    const ext = rpExtent();
+    const span = rp.view.end - rp.view.start;
+    const pad = rp.playing ? span * 1.5 : span * 0.5;
+    const start = Math.max(ext.start, rp.view.start - pad);
+    const end = Math.min(ext.end, rp.view.end + pad);
+    const width = $('rpChart').clientWidth || 800;
+    const maxPoints = Math.min(20000, Math.ceil(width * 1.5 * (end - start) / span));
+    const seq = ++rp.detailSeq;
+    rpSetLoading(1);
+    try {
+      const d = await rpFetch({ start, end, max_points: maxPoints });
+      if (seq !== rp.detailSeq) return;
+      d.range = { start, end, rows: d.range.rows };
+      rp.data = d;
+      rp.dirty = true;
+    } catch (err) {
+      if (seq === rp.detailSeq) showToast(err.message, 'error');
+    } finally {
+      rpSetLoading(-1);
+    }
+  }
+
+  function rpStatsRange() {
+    if (rp.sel) return { ...rp.sel, title: '选区' };
+    const ext = rpExtent();
+    const full = rp.view.start <= ext.start + 1e-9 && rp.view.end >= ext.end - 1e-9;
+    return full ? null : { start: rp.view.start, end: rp.view.end, title: '可见范围' };
+  }
+
+  function rpScheduleStats(delay = 250) {
+    clearTimeout(rp.statsTimer);
+    rp.statsTimer = setTimeout(rpLoadStats, delay);
+  }
+
+  async function rpLoadStats() {
+    if (!rp.open) return;
+    const r = rpStatsRange();
+    if (!r) { rpRenderStats(rp.full && rp.full.stats, '全部数据'); return; }
+    const seq = ++rp.statsSeq;
+    $('rpStats').classList.add('loading');
+    try {
+      const d = await rpFetch({ start: r.start, end: r.end, max_points: 10 });
+      if (seq !== rp.statsSeq) return;
+      rpRenderStats(d.stats, `${r.title} ${fmtElapsed(r.start - rpOrigin())} – ${fmtElapsed(r.end - rpOrigin())}`);
+    } catch (_) { /* 保留上一次 */ } finally {
+      if (seq === rp.statsSeq) $('rpStats').classList.remove('loading');
+    }
+  }
+
+  function rpRenderStats(st, title) {
+    if (title) setText('rpStatsTitle', title);
+    const u = rp.unit || '';
+    const f = (v) => {
+      if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+      const x = fmtEng(v, u, 6);
+      return x.text + ' ' + x.unit;
+    };
+    const items = st ? [
+      ['平均值', f(st.mean)], ['标准差', f(st.std)],
+      ['最小值', f(st.min)], ['最大值', f(st.max)],
+      ['峰峰值', f(st.pp)], ['RMS', f(st.rms)],
+      ['中位数', f(st.median)], ['时长', fmtDur(st.duration)],
+      ['有效样本', (st.n || 0).toLocaleString()],
+      ['OL', (st.n_ol || 0).toLocaleString(), st.n_ol > 0],
+      ['超限', (st.n_alarm || 0).toLocaleString(), st.n_alarm > 0],
+      ['采样率', st.duration > 0 ? ((st.n + st.n_ol - 1) / st.duration).toFixed(2) + ' S/s' : '—'],
+    ] : [];
+    const box = $('rpStats');
+    box.innerHTML = '';
+    for (const [label, value, warn] of items) {
+      const d = document.createElement('div');
+      d.className = 'rp-stat' + (warn ? ' warn' : '');
+      d.innerHTML = '<label></label><b></b>';
+      d.firstChild.textContent = label;
+      d.lastChild.textContent = value;
+      d.lastChild.title = value;
+      box.appendChild(d);
+    }
+  }
+
+  // ---- 视图操作 -----------------------------------------------------------
+  function rpMinSpan() {
+    const m = rp.meta;
+    const dt = m && m.rate_hz ? 1 / m.rate_hz : 0.05;
+    return Math.max(dt * 8, 0.05);
+  }
+
+  function rpSetView(start, end, { stats = true } = {}) {
+    const ext = rpExtent();
+    const full = ext.end - ext.start;
+    let span = Math.min(Math.max(end - start, rpMinSpan()), full);
+    if (start < ext.start) start = ext.start;
+    if (start + span > ext.end) start = ext.end - span;
+    rp.view = { start, end: start + span };
+    rp.dirty = true;
+    rpScheduleDetail(rp.playing ? 0 : 120);
+    if (stats && !rp.sel && !rp.playing) rpScheduleStats();
+  }
+
+  function rpZoom(factor, anchorT) {
+    const { start, end } = rp.view;
+    const t = anchorT ?? (start + end) / 2;
+    rpSetView(t - (t - start) * factor, t + (end - t) * factor);
+  }
+
+  function rpFit() { const e = rpExtent(); rpSetView(e.start, e.end); }
+
+  function rpSetSel(sel) {
+    rp.sel = sel && sel.end - sel.start > 1e-6 ? sel : null;
+    $('rpClearSel').disabled = !rp.sel;
+    $('rpZoomSel').disabled = !rp.sel;
+    rp.dirty = true;
+    rpScheduleStats(0);
+  }
+
+  function rpSeek(t, { follow = true } = {}) {
+    const ext = rpExtent();
+    rp.cursor = Math.min(ext.end, Math.max(ext.start, t));
+    if (follow) {
+      const span = rp.view.end - rp.view.start;
+      if (rp.cursor < rp.view.start || rp.cursor > rp.view.end) rpSetView(rp.cursor - span / 2, rp.cursor + span / 2);
+    }
+    rp.dirty = true;
+  }
+
+  function rpRenderPlay() {
+    $('rpPlay').classList.toggle('playing', rp.playing);
+    setText('rpPlayText', rp.playing ? '暂停' : '播放');
+    setText('rpSpeedAnn', rp.speed + '×');
+    for (const b of $('rpSpeed').querySelectorAll('button')) b.classList.toggle('active', Number(b.dataset.speed) === rp.speed);
+  }
+
+  function rpTogglePlay() {
+    if (!rp.meta || !rp.meta.rows) return;
+    const ext = rpExtent();
+    if (!rp.playing && rp.cursor >= ext.end - 1e-6) rp.cursor = ext.start;
+    rp.playing = !rp.playing;
+    rp.lastFrame = performance.now();
+    rpRenderPlay();
+    if (!rp.playing) rpScheduleStats(0);
+  }
+
+  // ---- 取值 --------------------------------------------------------------
+  function rpPointsFor() {
+    const d = rp.data;
+    if (d && d.range && d.range.start <= rp.view.start && d.range.end >= rp.view.end) return d;
+    return rp.full || d;
+  }
+
+  function rpIndexAt(points, t) {
+    let lo = 0, hi = points.length - 1;
+    if (hi < 0) return -1;
+    if (t <= points[0][0]) return 0;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (points[mid][0] <= t) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  function rpRenderReadout() {
+    const ext = rpExtent();
+    const d = rp.data && rp.data.range && rp.cursor >= rp.data.range.start && rp.cursor <= rp.data.range.end ? rp.data : rp.full;
+    const disp = $('rpDisplay');
+    let p = null;
+    if (d && d.points.length) p = d.points[rpIndexAt(d.points, rp.cursor)];
+    const unit = rp.unit || '';
+    const fn = rp.full && rp.full.functions && rp.full.functions.length === 1 ? rp.full.functions[0] : (rp.full && rp.full.functions || []).join('/');
+    setText('rpFn', fn || '—');
+    const ol = !!(p && (p[3] === null || p[3] === undefined));
+    $('rpOl').classList.toggle('on', ol || !!(p && p[4]));
+    $('rpAlm').classList.toggle('on', !!(p && p[5]));
+    $('rpApprox').classList.toggle('on', !!(d && !d.raw));
+    disp.classList.toggle('is-ol', ol);
+    disp.classList.toggle('is-alarm', !!(p && p[5]));
+    if (!p) { setText('rpValue', '--'); setText('rpUnit', unit); }
+    else if (ol) { setText('rpValue', 'OL'); setText('rpUnit', unit); }
+    else {
+      const x = fmtEng(p[3], unit, 7);
+      setText('rpValue', x.text);
+      setText('rpUnit', x.unit);
+    }
+    const origin = rpOrigin();
+    setText('rpTime', rp.meta && rp.meta.rows
+      ? `${fmtWall(rp.cursor)} · +${fmtElapsed(rp.cursor - origin, 0.01)}` : '—');
+    const total = ext.end - ext.start;
+    setText('rpClock', `${fmtElapsed(rp.cursor - origin)} / ${fmtElapsed(ext.end - origin)}`);
+    if (document.activeElement !== $('rpScrub')) {
+      $('rpScrub').value = String(Math.round((rp.cursor - ext.start) / (total || 1) * 10000));
+    }
+  }
+
+  // ---- 绘制 --------------------------------------------------------------
+  function rpCanvas(canvas) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, w, h };
+  }
+
+  function niceNum(x) {
+    const e = Math.floor(Math.log10(x));
+    const f = x / Math.pow(10, e);
+    return (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * Math.pow(10, e);
+  }
+
+  const TIME_STEPS = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+
+  function rpYRange(points, start, end) {
+    let lo = Infinity, hi = -Infinity;
+    for (const p of points) {
+      if (p[0] < start || p[0] > end || p[1] === null) continue;
+      if (p[1] < lo) lo = p[1];
+      if (p[2] > hi) hi = p[2];
+    }
+    if (!Number.isFinite(lo)) return [-1, 1];
+    if (hi - lo < Math.abs(hi) * 1e-9 + 1e-15) { const m = Math.abs(hi) * 0.001 || 1e-6; lo -= m; hi += m; }
+    const pad = (hi - lo) * 0.08;
+    return [lo - pad, hi + pad];
+  }
+
+  function rpDrawSeries(ctx, points, x, y, c, { envelope = true, lineWidth = 1.3 } = {}) {
+    if (!points.length) return;
+    const bucketed = points.some(p => p[1] !== p[2]);
+    if (bucketed && envelope) {
+      ctx.fillStyle = withAlpha(c.accent, 0.22);
+      ctx.beginPath();
+      let open = false;
+      const flush = (from, to) => {
+        // 多边形：上沿 max 向右，下沿 min 向左
+        ctx.moveTo(x(points[from][0]), y(points[from][2]));
+        for (let i = from + 1; i <= to; i++) ctx.lineTo(x(points[i][0]), y(points[i][2]));
+        for (let i = to; i >= from; i--) ctx.lineTo(x(points[i][0]), y(points[i][1]));
+        ctx.closePath();
+      };
+      let segStart = -1;
+      for (let i = 0; i <= points.length; i++) {
+        const ok = i < points.length && points[i][1] !== null;
+        if (ok && segStart < 0) segStart = i;
+        if (!ok && segStart >= 0) { flush(segStart, i - 1); segStart = -1; open = true; }
+      }
+      if (open || segStart >= 0) ctx.fill();
+    }
+    ctx.strokeStyle = c.accent;
+    ctx.lineWidth = lineWidth;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    let pen = false;
+    for (const p of points) {
+      if (p[3] === null || p[3] === undefined) { pen = false; continue; }
+      const px = x(p[0]), py = y(p[3]);
+      if (pen) ctx.lineTo(px, py); else { ctx.moveTo(px, py); pen = true; }
+    }
+    ctx.stroke();
+  }
+
+  function rpDraw() {
+    const c = rpColors();
+    const { ctx, w, h } = rpCanvas($('rpChart'));
+    ctx.clearRect(0, 0, w, h);
+    const padL = 74, padR = 12, padT = 12, padB = 24;
+    const pw = Math.max(10, w - padL - padR), ph = Math.max(10, h - padT - padB);
+    const { start, end } = rp.view;
+    const span = end - start || 1;
+    const ext = rpExtent();
+    const src = rpPointsFor();
+    const pts = src ? src.points : [];
+    const i0 = Math.max(0, rpIndexAt(pts, start) - 1);
+    const i1 = Math.min(pts.length, rpIndexAt(pts, end) + 2);
+    const vis = pts.slice(i0, i1);
+    const [ylo, yhi] = rpYRange(vis, start, end);
+    const x = (t) => padL + (t - start) / span * pw;
+    const y = (v) => padT + (1 - (v - ylo) / (yhi - ylo)) * ph;
+    rp.geom = { padL, padR, padT, padB, pw, ph, x, y, ylo, yhi, w, h };
+
+    // 网格与坐标
+    ctx.font = '11px ' + cssVar('--mono');
+    ctx.textBaseline = 'middle';
+    const ystep = niceNum((yhi - ylo) / Math.max(2, Math.floor(ph / 46)));
+    ctx.strokeStyle = c.grid; ctx.lineWidth = 1; ctx.fillStyle = c.muted; ctx.textAlign = 'right';
+    for (let v = Math.ceil(ylo / ystep) * ystep; v <= yhi; v += ystep) {
+      const py = Math.round(y(v)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(padL, py); ctx.lineTo(padL + pw, py); ctx.stroke();
+      const lab = fmtEng(Math.abs(v) < ystep * 1e-6 ? 0 : v, rp.unit || '', 4);
+      ctx.fillText(lab.text + ' ' + lab.unit, padL - 6, py);
+    }
+    const tstep = TIME_STEPS.find(s => s >= span / Math.max(2, pw / 92)) || 86400;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const origin = rpOrigin();
+    const rel0 = start - origin;
+    for (let r = Math.ceil(rel0 / tstep) * tstep; r <= rel0 + span; r += tstep) {
+      const px = Math.round(x(origin + r)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(px, padT); ctx.lineTo(px, padT + ph); ctx.stroke();
+      ctx.fillText(fmtElapsed(r, tstep), px, padT + ph + 6);
+    }
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(padL, padT, pw, ph); ctx.clip();
+
+    // OL / 超限区间：连续的点合并成一段，淡色底 + 顶部（超限）/底部（OL）色带
+    const runs = (col) => {
+      const out = [];
+      let a = null;
+      for (let i = 0; i < vis.length; i++) {
+        const on = !!vis[i][col];
+        if (on && a === null) a = i;
+        if ((!on || i === vis.length - 1) && a !== null) {
+          const b = on ? i : i - 1;
+          const half = vis.length > 1 ? (x(vis[Math.min(vis.length - 1, b + 1)][0]) - x(vis[b][0])) / 2 : 1;
+          out.push([x(vis[a][0]) - Math.max(1, half), x(vis[b][0]) + Math.max(1, half)]);
+          a = null;
+        }
+      }
+      return out;
+    };
+    for (const [a, b] of runs(5)) {
+      ctx.fillStyle = withAlpha(c.bad, 0.07); ctx.fillRect(a, padT, b - a, ph);
+      ctx.fillStyle = withAlpha(c.bad, 0.75); ctx.fillRect(a, padT, Math.max(2, b - a), 3);
+    }
+    for (const [a, b] of runs(4)) {
+      ctx.fillStyle = withAlpha(c.warn, 0.08); ctx.fillRect(a, padT, b - a, ph);
+      ctx.fillStyle = withAlpha(c.warn, 0.85); ctx.fillRect(a, padT + ph - 3, Math.max(2, b - a), 3);
+    }
+    // 功能/单位切换标记
+    if (rp.meta && rp.meta.segments) {
+      ctx.setLineDash([3, 4]); ctx.strokeStyle = c.warn; ctx.fillStyle = c.warn;
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      rp.meta.segments.forEach((sg, i) => {
+        if (i === 0 || sg.start < start || sg.start > end) return;
+        const px = Math.round(x(sg.start)) + 0.5;
+        ctx.beginPath(); ctx.moveTo(px, padT); ctx.lineTo(px, padT + ph); ctx.stroke();
+        ctx.fillText(sg.function || sg.unit, px + 4, padT + 2);
+      });
+      ctx.setLineDash([]);
+    }
+    // 选区
+    if (rp.sel) {
+      const sx = x(rp.sel.start), ex = x(rp.sel.end);
+      ctx.fillStyle = withAlpha(c.accent, 0.12);
+      ctx.fillRect(sx, padT, ex - sx, ph);
+      ctx.strokeStyle = withAlpha(c.accent, 0.8); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(sx + 0.5, padT); ctx.lineTo(sx + 0.5, padT + ph);
+      ctx.moveTo(ex - 0.5, padT); ctx.lineTo(ex - 0.5, padT + ph); ctx.stroke();
+    }
+    rpDrawSeries(ctx, vis, x, y, c);
+
+    // 播放光标
+    if (rp.cursor >= start && rp.cursor <= end) {
+      const cx = Math.round(x(rp.cursor)) + 0.5;
+      ctx.strokeStyle = c.warn; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT + ph); ctx.stroke();
+      const p = vis.length ? vis[rpIndexAt(vis, rp.cursor)] : null;
+      if (p && p[3] !== null && p[3] !== undefined) {
+        ctx.fillStyle = c.warn;
+        ctx.beginPath(); ctx.arc(cx, y(p[3]), 4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // 悬停十字线
+    if (rp.hover && !rp.drag) {
+      ctx.strokeStyle = withAlpha(c.ink, 0.35); ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(rp.hover.x + 0.5, padT); ctx.lineTo(rp.hover.x + 0.5, padT + ph); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // 拖选预览
+    if (rp.drag && rp.drag.kind === 'select') {
+      const a = Math.min(rp.drag.x0, rp.drag.x1), b = Math.max(rp.drag.x0, rp.drag.x1);
+      ctx.fillStyle = withAlpha(c.accent, 0.18);
+      ctx.fillRect(a, padT, b - a, ph);
+    }
+    ctx.restore();
+
+    if (!pts.length) {
+      ctx.fillStyle = c.muted; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.fillText(rp.meta ? '该单位没有数据' : '读取中…', padL + pw / 2, padT + ph / 2);
+    }
+  }
+
+  function rpDrawNav() {
+    const c = rpColors();
+    const { ctx, w, h } = rpCanvas($('rpNav'));
+    ctx.clearRect(0, 0, w, h);
+    if (!rp.full || !rp.full.points.length) return;
+    const ext = rpExtent();
+    const span = ext.end - ext.start;
+    const pts = rp.full.points;
+    const [ylo, yhi] = rpYRange(pts, ext.start, ext.end);
+    const x = (t) => 4 + (t - ext.start) / span * (w - 8);
+    const y = (v) => 4 + (1 - (v - ylo) / (yhi - ylo)) * (h - 8);
+    rp.navGeom = { x, w, ext, span };
+    rpDrawSeries(ctx, pts, x, y, c, { lineWidth: 1 });
+    const vx0 = x(rp.view.start), vx1 = x(rp.view.end);
+    ctx.fillStyle = withAlpha(c.panel, 0.55);
+    ctx.fillRect(0, 0, vx0, h); ctx.fillRect(vx1, 0, w - vx1, h);
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5;
+    ctx.strokeRect(vx0 + 0.75, 0.75, Math.max(2, vx1 - vx0 - 1.5), h - 1.5);
+    if (rp.sel) {
+      ctx.fillStyle = withAlpha(c.accent, 0.18);
+      ctx.fillRect(x(rp.sel.start), 0, Math.max(1, x(rp.sel.end) - x(rp.sel.start)), h);
+    }
+    const cx = Math.round(x(rp.cursor)) + 0.5;
+    ctx.strokeStyle = c.warn; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+  }
+
+  function rpTick(now) {
+    rp.raf = 0;
+    if (!rp.open) return;
+    if (rp.playing) {
+      const dt = Math.min(0.25, (now - rp.lastFrame) / 1000);
+      const ext = rpExtent();
+      rp.cursor += dt * rp.speed;
+      if (rp.cursor >= ext.end) {
+        rp.cursor = ext.end;
+        rp.playing = false;
+        rpRenderPlay();
+        rpScheduleStats(0);
+      }
+      // 视图跟随：光标保持在可见范围约 70% 处
+      const span = rp.view.end - rp.view.start;
+      if (span < ext.end - ext.start - 1e-9 && (rp.cursor > rp.view.start + span * 0.85 || rp.cursor < rp.view.start)) {
+        rpSetView(rp.cursor - span * 0.7, rp.cursor + span * 0.3, { stats: false });
+      }
+      rp.dirty = true;
+    }
+    rp.lastFrame = now;
+    if (rp.dirty) {
+      rp.dirty = false;
+      rpDraw();
+      rpDrawNav();
+      rpRenderReadout();
+    }
+    rp.raf = requestAnimationFrame(rpTick);
+  }
+
+  function rpTimeAtX(px) {
+    const g = rp.geom;
+    if (!g) return rp.view.start;
+    return rp.view.start + (px - g.padL) / g.pw * (rp.view.end - rp.view.start);
+  }
+
+  function rpShowTip(px, py) {
+    const tip = $('rpTip');
+    const src = rpPointsFor();
+    if (!src || !src.points.length || !rp.geom) { tip.classList.add('hidden'); return; }
+    const t = rpTimeAtX(px);
+    const p = src.points[rpIndexAt(src.points, t)];
+    if (!p) { tip.classList.add('hidden'); return; }
+    const u = rp.unit || '';
+    let val;
+    if (p[3] === null || p[3] === undefined) val = 'OL';
+    else if (p[1] !== p[2]) {
+      const a = fmtEng(p[1], u, 6), b = fmtEng(p[2], u, 6), m = fmtEng(p[3], u, 7);
+      val = `${m.text} ${m.unit}<br><span class="tip-t">区间 ${a.text} ${a.unit} … ${b.text} ${b.unit}</span>`;
+    } else { const m = fmtEng(p[3], u, 7); val = `${m.text} ${m.unit}`; }
+    tip.innerHTML = `<div class="tip-v">${val}</div><div class="tip-t">${fmtWall(p[0])} · +${fmtElapsed(p[0] - rpOrigin(), 0.01)}</div>`
+      + (p[5] ? '<div class="tip-t" style="color:var(--bad)">超限</div>' : '');
+    tip.classList.remove('hidden');
+    const wrap = $('rpChartWrap');
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.left = Math.min(wrap.clientWidth - tw - 6, Math.max(6, px + 12)) + 'px';
+    tip.style.top = Math.min(wrap.clientHeight - th - 6, Math.max(6, py - th - 8)) + 'px';
+  }
+
+  // ---- 交互 --------------------------------------------------------------
+  (function bindReplay() {
+    const cv = $('rpChart');
+    const local = (e) => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+
+    cv.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      cv.setPointerCapture(e.pointerId);
+      const p = local(e);
+      const kind = (rp.mode === 'select' || e.shiftKey) ? 'select' : 'pan';
+      rp.drag = { kind, x0: p.x, x1: p.x, view0: { ...rp.view }, moved: false };
+      cv.classList.toggle('dragging', kind === 'pan');
+      $('rpTip').classList.add('hidden');
+    });
+    cv.addEventListener('pointermove', (e) => {
+      const p = local(e);
+      if (!rp.drag) {
+        rp.hover = p;
+        rpShowTip(p.x, p.y);
+        rp.dirty = true;
+        return;
+      }
+      rp.drag.x1 = p.x;
+      if (Math.abs(p.x - rp.drag.x0) > 3) rp.drag.moved = true;
+      if (rp.drag.kind === 'pan' && rp.drag.moved && rp.geom) {
+        const v0 = rp.drag.view0;
+        const dt = (p.x - rp.drag.x0) / rp.geom.pw * (v0.end - v0.start);
+        rpSetView(v0.start - dt, v0.end - dt);
+      }
+      rp.dirty = true;
+    });
+    const end = (e) => {
+      if (!rp.drag) return;
+      const d = rp.drag;
+      rp.drag = null;
+      cv.classList.remove('dragging');
+      if (!d.moved) {
+        rpSeek(rpTimeAtX(d.x0), { follow: false });   // 单击：定位播放位置
+      } else if (d.kind === 'select') {
+        const a = rpTimeAtX(Math.min(d.x0, d.x1)), b = rpTimeAtX(Math.max(d.x0, d.x1));
+        const ext = rpExtent();
+        rpSetSel({ start: Math.max(ext.start, a), end: Math.min(ext.end, b) });
+      }
+      rp.dirty = true;
+    };
+    cv.addEventListener('pointerup', end);
+    cv.addEventListener('pointercancel', end);
+    cv.addEventListener('pointerleave', () => { rp.hover = null; $('rpTip').classList.add('hidden'); rp.dirty = true; });
+    cv.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const p = local(e);
+      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      if (Math.abs(e.deltaX) > Math.abs(dy)) {
+        const span = rp.view.end - rp.view.start;
+        const dt = e.deltaX / (rp.geom ? rp.geom.pw : 800) * span;
+        rpSetView(rp.view.start + dt, rp.view.end + dt);
+      } else {
+        rpZoom(Math.pow(1.0015, dy), rpTimeAtX(p.x));
+      }
+      rpShowTip(p.x, p.y);
+    }, { passive: false });
+    cv.addEventListener('dblclick', rpFit);
+
+    // 导航条：点击/拖动移动视图
+    const nav = $('rpNav');
+    let navDrag = false;
+    const navMove = (e) => {
+      if (!rp.navGeom) return;
+      const r = nav.getBoundingClientRect();
+      const g = rp.navGeom;
+      const t = g.ext.start + (e.clientX - r.left - 4) / (g.w - 8) * g.span;
+      const span = rp.view.end - rp.view.start;
+      rpSetView(t - span / 2, t + span / 2);
+    };
+    nav.addEventListener('pointerdown', (e) => { navDrag = true; nav.setPointerCapture(e.pointerId); navMove(e); });
+    nav.addEventListener('pointermove', (e) => { if (navDrag) navMove(e); });
+    nav.addEventListener('pointerup', () => { navDrag = false; });
+    nav.addEventListener('pointercancel', () => { navDrag = false; });
+
+    $('rpMode').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-mode]');
+      if (!b) return;
+      rp.mode = b.dataset.mode;
+      for (const x of $('rpMode').querySelectorAll('button')) x.classList.toggle('active', x === b);
+      $('rpChartWrap').classList.toggle('mode-select', rp.mode === 'select');
+    });
+    $('rpSpeed').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-speed]');
+      if (!b) return;
+      rp.speed = Number(b.dataset.speed);
+      rpRenderPlay();
+    });
+    $('rpPlay').addEventListener('click', rpTogglePlay);
+    $('rpFit').addEventListener('click', rpFit);
+    $('rpClearSel').addEventListener('click', () => rpSetSel(null));
+    $('rpZoomSel').addEventListener('click', () => {
+      if (!rp.sel) return;
+      const pad = (rp.sel.end - rp.sel.start) * 0.05;
+      rpSetView(rp.sel.start - pad, rp.sel.end + pad);
+    });
+    $('rpScrub').addEventListener('input', () => {
+      const ext = rpExtent();
+      rpSeek(ext.start + Number($('rpScrub').value) / 10000 * (ext.end - ext.start));
+    });
+    $('rpExport').addEventListener('click', () => {
+      if (!rp.name) return;
+      const r = rp.sel || rp.view;
+      const a = document.createElement('a');
+      a.href = `/api/logs/${encodeURIComponent(rp.name)}/download?start=${r.start}&end=${r.end}`;
+      a.setAttribute('download', '');
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+    $('rpReload').addEventListener('click', () => withBusy($('rpReload'), () => rpLoadFull(false)));
+    $('rpClose').addEventListener('click', closeReplay);
+    $('replayLayer').addEventListener('click', (e) => { if (e.target === $('replayLayer')) closeReplay(); });
+    window.addEventListener('resize', () => { if (rp.open) { rp.dirty = true; rpScheduleDetail(); } });
+
+    // 回放窗口内的快捷键（优先于全局快捷键）
+    document.addEventListener('keydown', (e) => {
+      if (!rp.open) return;
+      if (e.key === 'Escape') { e.stopImmediatePropagation(); closeReplay(); return; }
+      if (isTyping(e.target) && e.target.id !== 'rpScrub') { e.stopImmediatePropagation(); return; }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const span = rp.view.end - rp.view.start;
+      const step = e.shiftKey ? span / 4 : span / 40;
+      switch (e.key) {
+        case ' ': rpTogglePlay(); break;
+        case 'ArrowRight': rpSeek(rp.cursor + step); break;
+        case 'ArrowLeft': rpSeek(rp.cursor - step); break;
+        case '+': case '=': rpZoom(1 / 1.6, rp.cursor); break;
+        case '-': case '_': rpZoom(1.6, rp.cursor); break;
+        case '0': rpFit(); break;
+        case 'Home': rpSeek(rpExtent().start); break;
+        case 'End': rpSeek(rpExtent().end); break;
+        default: e.stopImmediatePropagation(); return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }, true);
+  })();
 
   // ------------------------------------------------------------------
   // 初始化
