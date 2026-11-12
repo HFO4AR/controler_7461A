@@ -110,7 +110,7 @@ def t_measure(args):
 
 def t_setup(args):
     body = {k: args[k] for k in ("function", "range", "rate", "trigger", "display_mode",
-                                 "shunt_ohm", "settle") if k in args}
+                                 "shunt_ohm", "cont_threshold", "settle") if k in args}
     if not body:
         raise ApiError("至少给出一个要设置的参数")
     return http("POST", "/api/agent/setup", body, timeout=(_num(args.get("settle"), 0) or 0) + 40)
@@ -236,7 +236,8 @@ TOOLS = [
     },
     {
         "name": "dmm_options",
-        "description": "列出可用的功能、量程、速率、触发源代码；include_advanced=true 时同时列出高级设置项。",
+        "description": "列出可用的功能（含每个功能的可选量程 ranges、固定量程 fixed_range、可用设置 features）、"
+                       "速率、触发源代码；include_advanced=true 时同时列出高级设置项。",
         "inputSchema": {"type": "object", "properties": {
             "include_advanced": {"type": "boolean", "default": False}}},
         "annotations": {"readOnlyHint": True},
@@ -267,17 +268,19 @@ TOOLS = [
     },
     {
         "name": "dmm_setup",
-        "description": "设置测量参数（只改给出的字段）。function 功能、range 量程（AUTO/R3..R7）、"
+        "description": "设置测量参数（只改给出的字段）。function 功能、range 量程（AUTO 或 R3..R9，"
+                       "各功能可选量程不同，见 dmm_options 的 functions[].ranges；DCV_BCH/DIODE/CONT 为固定量程）、"
                        "rate 速率（PR0..PR5）、trigger 触发（TRS0..TRS5）、display_mode "
-                       "（voltage 直接电压 / current 分流电流，后者强制 DCV）、shunt_ohm 分流电阻。"
-                       "settle>0 时等待后返回一个新读数。",
+                       "（voltage 直接电压 / current 分流电流，后者强制 DCV）、shunt_ohm 分流电阻、"
+                       "cont_threshold 通断阈值 1~1000 Ω（仅 CONT 功能）。settle>0 时等待后返回一个新读数。",
         "inputSchema": {"type": "object", "properties": {
             "function": {"type": "string", "enum": FUNCTION_CODES},
-            "range": {"type": "string", "enum": ["AUTO", "R3", "R4", "R5", "R6", "R7"]},
+            "range": {"type": "string", "enum": ["AUTO", "R3", "R4", "R5", "R6", "R7", "R8", "R9"]},
             "rate": {"type": "string", "enum": ["PR0", "PR1", "PR2", "PR3", "PR4", "PR5"]},
             "trigger": {"type": "string", "enum": ["TRS0", "TRS1", "TRS2", "TRS3", "TRS4", "TRS5"]},
             "display_mode": {"type": "string", "enum": ["voltage", "current"]},
             "shunt_ohm": {"type": "number", "minimum": 1e-6, "maximum": 1e6},
+            "cont_threshold": {"type": "integer", "minimum": 1, "maximum": 1000},
             "settle": {"type": "number", "minimum": 0, "maximum": 60}}},
         "fn": t_setup,
     },

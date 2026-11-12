@@ -136,6 +136,8 @@ RANGES = {
     "R5": ("R5", "10 V"),
     "R6": ("R6", "100 V"),
     "R7": ("R7", "1000 V / 700 V"),
+    "R8": ("R8", "10 MΩ / 3 A"),
+    "R9": ("R9", "100 MΩ"),
 }
 
 RATES = {
@@ -997,7 +999,14 @@ class SimulatedDMM(_StateMixin):
                 continue
             t = time.monotonic() - t0
             fn = self.snapshot()["function"] or "DCV"
-            if self._ol:
+            # 通断档：模拟表笔接触/断开交替（约 3 s 切换），便于演示通断判定
+            cont_open = fn == "CONT" and int(t / 3) % 2 == 1
+            if fn == "CONT" and not self._ol and not cont_open:
+                value = 2.35 + (__import__("random").random() - 0.5) * 0.02
+                self._emit_sample({"t": time.time(), "mono": time.monotonic(), "v": value,
+                                   "ol": False, "tag": "RCT_", "raw": f"{value:+.7E}"})
+                continue
+            if self._ol or cont_open:
                 value = 9.999999e37
                 sample = {"t": time.time(), "mono": time.monotonic(), "v": None, "ol": True,
                           "tag": {"DCV": "DCV_"}.get(fn), "raw": "+9.999999E+37"}

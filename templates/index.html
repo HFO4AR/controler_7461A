@@ -76,6 +76,9 @@
             <span id="valueText" class="value">--</span>
             <span id="unitText" class="unit">V</span>
           </button>
+          <div id="contJudge" class="cont-judge hidden" aria-live="polite">
+            <span class="cont-dot"></span><b id="contJudgeText">—</b><span id="contJudgeSub"></span>
+          </div>
           <div class="display-state" id="displayState"></div>
           <div class="scanbar" aria-hidden="true"></div>
         </div>
@@ -173,9 +176,9 @@
       </div>
     </section>
 
-    <div class="two-col">
+    <div class="two-col" id="twoCol">
       <!-- 分流测电流 -->
-      <section class="card shunt-card">
+      <section class="card shunt-card" id="shuntCard">
         <div class="card-head"><h2>分流电阻测电流</h2></div>
         <div class="seg seg-wide" id="modeGroup" role="group" aria-label="显示模式">
           <button data-mode="voltage">直接测量</button>
@@ -199,7 +202,7 @@
       </section>
 
       <!-- 限值报警 -->
-      <section class="card limits-card">
+      <section class="card limits-card" id="limitsCard">
         <div class="card-head">
           <h2>限值报警</h2>
           <span id="limitModeLabel" class="tag">作用量：电压</span>
@@ -286,7 +289,7 @@
         <label for="triggerSelect">触发源</label>
         <select id="triggerSelect"></select>
       </div>
-      <div class="it-block">
+      <div class="it-block" id="itBlock">
         <div class="it-head">
           <span>任意积分时间</span>
           <span id="itReadback" class="it-readback">—</span>
@@ -301,7 +304,7 @@
         </div>
         <p class="hint">0.02–100 PLC 或 0.00001–10 s；应用后切换为 PR0 自由采样</p>
       </div>
-      <div class="null-block">
+      <div class="null-block" id="nullBlock">
         <div class="null-head">
           <span>NULL 相对值</span>
           <label class="switch-row null-switch">
@@ -315,6 +318,34 @@
         </div>
       </div>
       <p class="hint" id="controlHint">选择后立即生效，以仪器回读值为准。</p>
+    </section>
+
+    <!-- 当前功能专属设置（随功能显示） -->
+    <section class="card fn-settings-card hidden" id="fnSettingsCard">
+      <div class="card-head">
+        <h2 id="fnSettingsTitle">功能设置</h2>
+        <span id="fnSettingsCode" class="code-pill">—</span>
+      </div>
+      <div id="contBlock" class="cont-block hidden">
+        <div class="cont-head">
+          <label for="contValue">通断阈值</label>
+          <span id="contReadback" class="it-readback">当前：—</span>
+        </div>
+        <div class="it-controls">
+          <input id="contValue" type="number" min="1" max="1000" step="1" inputmode="numeric" placeholder="1 – 1000">
+          <span class="unit-fixed">Ω</span>
+          <button id="contApply" class="btn btn-primary btn-sm">应用</button>
+        </div>
+        <div class="chip-row" id="contPresets" role="group" aria-label="常用阈值">
+          <button type="button" data-v="1">1 Ω</button>
+          <button type="button" data-v="10">10 Ω</button>
+          <button type="button" data-v="50">50 Ω</button>
+          <button type="button" data-v="100">100 Ω</button>
+          <button type="button" data-v="500">500 Ω</button>
+        </div>
+        <p class="hint">电阻低于阈值判定为导通，仪器蜂鸣。范围 1 – 1000 Ω。</p>
+      </div>
+      <div id="fnAdvList" class="fn-adv-list"></div>
     </section>
   </aside>
 

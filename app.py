@@ -66,10 +66,85 @@ FUNCTION_NOTES = {
     "FREQ": "频率测量，单位 Hz。",
 }
 
+# ---------------------------------------------------------------------------
+# 功能配置：每个测量功能可用的量程与设置（依据手册 Table 5-2 / 6.7.3 R 命令表）
+#   features: shunt 分流测电流 · limits 软件限值 · integration 积分时间 · null NULL 相对值
+#             cont_threshold 通断阈值；AC 滤波/输入阻抗等由高级设置项的 applies 决定
+# ---------------------------------------------------------------------------
+_RNG_DCV = [("R3", "100 mV"), ("R4", "1000 mV"), ("R5", "10 V"), ("R6", "100 V"), ("R7", "1000 V")]
+_RNG_ACV = _RNG_DCV[:4] + [("R7", "700 V")]
+_RNG_RES = [("R3", "100 Ω"), ("R4", "1000 Ω"), ("R5", "10 kΩ"), ("R6", "100 kΩ"),
+            ("R7", "1000 kΩ"), ("R8", "10 MΩ"), ("R9", "100 MΩ")]
+_RNG_RES_LP = _RNG_RES[:6]
+_RNG_I = [("R4", "1000 µA"), ("R5", "10 mA"), ("R6", "100 mA"), ("R7", "1000 mA"), ("R8", "3 A")]
+_RNG_FREQ = [(c, "输入 " + label) for c, label in _RNG_ACV]
+
+_F_DC = ["limits", "integration", "null"]
+_F_AC = ["limits", "null"]
+_F_RES = ["integration", "null"]
+
+FUNCTION_PROFILES = {
+    "DCV": {"ranges": _RNG_DCV, "features": ["shunt"] + _F_DC},
+    "DCV_BCH": {"fixed_range": "10 V", "features": _F_DC},
+    "ACV": {"ranges": _RNG_ACV, "features": _F_AC},
+    "ACV_DC": {"ranges": _RNG_ACV, "features": _F_AC},
+    "RES2W": {"ranges": _RNG_RES, "features": _F_RES},
+    "RES4W": {"ranges": _RNG_RES, "features": _F_RES},
+    "RES2W_LP": {"ranges": _RNG_RES_LP, "features": _F_RES},
+    "RES4W_LP": {"ranges": _RNG_RES_LP, "features": _F_RES},
+    "CONT": {"fixed_range": "1000 Ω", "features": ["integration", "cont_threshold"]},
+    "DCI": {"ranges": _RNG_I, "features": _F_DC},
+    "ACI": {"ranges": _RNG_I, "features": _F_AC},
+    "ACI_DC": {"ranges": _RNG_I, "features": _F_AC},
+    "DIODE": {"fixed_range": "1000 mV", "features": _F_DC},
+    "FREQ": {"ranges": _RNG_FREQ, "features": ["null"]},
+}
+
+
+def function_ranges(function):
+    """该功能可选的量程 [{code, label}]；固定量程功能返回空列表。"""
+    prof = FUNCTION_PROFILES.get(function or "")
+    if not prof or prof.get("fixed_range"):
+        return []
+    return [{"code": "AUTO", "label": "自动"}] + [
+        {"code": c, "label": label} for c, label in prof["ranges"]]
+
+
+def range_label(function, code):
+    prof = FUNCTION_PROFILES.get(function or "")
+    if prof and prof.get("fixed_range"):
+        return prof["fixed_range"]
+    if code == "AUTO":
+        return "自动"
+    for item in function_ranges(function):
+        if item["code"] == code:
+            return item["label"]
+    return dmm7461a.RANGES.get(code, (None, code))[1] if code else None
+
+
+def has_feature(function, feature: str) -> bool:
+    return feature in FUNCTION_PROFILES.get(function or "", {}).get("features", [])
+
+
+def check_range_for_function(function, code):
+    """量程是否适用于当前功能；不适用时抛 ValueError。"""
+    prof = FUNCTION_PROFILES.get(function or "")
+    if not prof:
+        return
+    if prof.get("fixed_range"):
+        raise ValueError(f"{dmm7461a.FUNCTIONS[function][3]}为固定量程（{prof['fixed_range']}）")
+    allowed = [r["code"] for r in function_ranges(function)]
+    if code not in allowed:
+        raise ValueError(f"{dmm7461a.FUNCTIONS[function][3]}可选量程：{', '.join(allowed)}")
+
+
 META = {
     "functions": [
         {"code": code, "label": meta[3], "unit": UNIT_LABEL.get(meta[2], meta[2]),
-         "note": FUNCTION_NOTES.get(code, "")}
+         "note": FUNCTION_NOTES.get(code, ""),
+         "ranges": function_ranges(code),
+         "fixed_range": FUNCTION_PROFILES.get(code, {}).get("fixed_range"),
+         "features": FUNCTION_PROFILES.get(code, {}).get("features", [])}
         for code, meta in dmm7461a.FUNCTIONS.items()
     ],
     "ranges": [
@@ -446,6 +521,7 @@ class Hub:
         self._pending_samples: list = []
         self._last_sample_push = 0.0
         self.config = {"display_mode": "voltage", "shunt_ohm": 0.1}
+        self.cont_threshold = None   # 通断阈值（Ω），读/写 KOM 时更新
         self.limits = {
             "voltage": {"enabled": False, "low": None, "high": None},
             "current": {"enabled": False, "low": None, "high": None},
@@ -653,7 +729,7 @@ class Hub:
                     "function": device.get("function"),
                     "function_label": device.get("function_label"),
                     "range": device.get("range"),
-                    "range_label": device.get("range_label"),
+                    "range_label": range_label(device.get("function"), device.get("range")),
                     "rate": device.get("rate"),
                     "rate_label": device.get("rate_label"),
                     "trigger": device.get("trigger"),
@@ -669,6 +745,7 @@ class Hub:
                 "config": dict(self.config),
                 "limits": json.loads(json.dumps(self.limits)),
                 "alarm": self.last_alarm,
+                "cont_threshold": self.cont_threshold,
                 "logging": self.logger.state(),
                 "stats": self._stats_payload(),
                 "context_id": self.context_id,
@@ -959,7 +1036,9 @@ def api_control():
         if action == "function":
             result = dmm.set_function(str(value))
         elif action == "range":
-            result = dmm.set_range("AUTO" if value in ("AUTO", "R0") else str(value))
+            code = "AUTO" if str(value).upper() in ("AUTO", "R0") else str(value).upper()
+            check_range_for_function(dmm.status_snapshot().get("function"), code)
+            result = dmm.set_range(code)
         elif action == "rate":
             result = dmm.set_rate(str(value))
         elif action == "trigger":
@@ -979,6 +1058,10 @@ def api_control():
     except dmm7461a.LocalMode as exc:
         return _api_error(str(exc), "local_mode", 409)
 
+    result = dict(result)
+    result["range_label"] = range_label(result.get("function"), result.get("range"))
+    if result.get("function") == "CONT" and action in ("function", "sync"):
+        refresh_cont_threshold()
     return jsonify({"ok": True, "instrument": result,
                     "applied": {k: result.get(k) for k in ("function", "range", "rate", "trigger")}})
 
@@ -1162,6 +1245,8 @@ def api_advanced_read():
         try:
             values[key] = {"ok": True, "value": dmm.query_command(
                 item["query"], first_message=item.get("first_message", False))}
+            if key == "cont_limit" and _parse_kom(values[key]["value"]) is not None:
+                hub().cont_threshold = _parse_kom(values[key]["value"])
         except dmm7461a.DMMError as exc:
             values[key] = {"ok": False, "error": str(exc),
                            "code": getattr(exc, "code", "error")}
@@ -1225,6 +1310,10 @@ def api_advanced_set():
             dmm.sync_state()
         except dmm7461a.DMMError:
             warning = warning or "设置已发送，状态回读超时；稍后会自动同步"
+    if key == "cont_limit":
+        h = hub()
+        h.cont_threshold = _parse_kom(reply) or int(formatted)
+        h._broadcast("state", h.state())
     return jsonify({"ok": True, "sent": cmd, "value": reply, "warning": warning})
 
 
@@ -1334,6 +1423,24 @@ def api_dev_sim():
 # Agent 接口：为 AI agent / 脚本设计的高层接口（一次调用完成“设置 → 等待 → 取数”）
 # 详见 docs/AGENT.md；MCP 服务器 mcp_server.py 也是基于这些接口。
 # ---------------------------------------------------------------------------
+def _parse_kom(reply):
+    m = re.search(r"KOM\s*\+?(\d+(?:\.\d+)?)", str(reply or ""), re.I)
+    return int(float(m.group(1))) if m else None
+
+
+def refresh_cont_threshold():
+    """从仪器回读通断阈值并缓存；失败时返回缓存值。"""
+    h = hub()
+    try:
+        value = _parse_kom(h.dmm.query_command("KOM?"))
+    except dmm7461a.DMMError:
+        return h.cont_threshold
+    if value is not None and value != h.cont_threshold:
+        h.cont_threshold = value
+        h._broadcast("state", h.state())
+    return h.cont_threshold
+
+
 AGENT_MAX_SAMPLES = 5000
 AGENT_MAX_WAIT = 120.0
 
@@ -1357,6 +1464,11 @@ def _agent_reading(s: dict | None) -> dict | None:
         "rate": s.get("rate"),
         "alarm": s.get("alarm"),
         "context_id": s.get("ctx"),
+        **({"continuity": (not s.get("ol") and s.get("v") is not None
+                           and hub().cont_threshold is not None
+                           and s["v"] < hub().cont_threshold),
+            "cont_threshold": hub().cont_threshold}
+           if s.get("fn") == "CONT" else {}),
     }
 
 
@@ -1435,7 +1547,11 @@ def _wait_samples(after_seq: int, count: int | None, seconds: float | None,
 
 
 def _agent_status() -> dict:
-    st = hub().state()
+    h = hub()
+    if (h.dmm and h.dmm.status_snapshot().get("function") == "CONT"
+            and h.cont_threshold is None):
+        refresh_cont_threshold()
+    st = h.state()
     with hub().lock:
         latest = hub().samples[-1] if hub().samples else None
     stats = st["stats"]
@@ -1451,6 +1567,9 @@ def _agent_status() -> dict:
         "config": st["config"],
         "limits": st["limits"],
         "alarm": st["alarm"],
+        "cont_threshold": st["cont_threshold"],
+        "available_ranges": function_ranges(st["instrument"].get("function")),
+        "features": FUNCTION_PROFILES.get(st["instrument"].get("function") or "", {}).get("features", []),
         "logging": st["logging"],
         "latest": _agent_reading(latest),
         "stats": stats,
@@ -1473,7 +1592,7 @@ def api_agent_manifest():
             {"method": "POST", "path": "/api/agent/measure",
              "desc": "采集新样本并返回统计：{count|seconds, settle, timeout, include_samples}"},
             {"method": "POST", "path": "/api/agent/setup",
-             "desc": "一次设置 {function, range, rate, trigger, display_mode, shunt_ohm}，可带 settle 后读一次"},
+             "desc": "一次设置 {function, range, rate, trigger, display_mode, shunt_ohm, cont_threshold}，可带 settle 后读一次"},
             {"method": "GET", "path": "/api/history", "desc": "历史样本 ?seconds=60"},
             {"method": "POST", "path": "/api/limits", "desc": "上下限报警 {mode, enabled, low, high}"},
             {"method": "POST", "path": "/api/stats/reset", "desc": "重置统计"},
@@ -1491,6 +1610,8 @@ def api_agent_manifest():
         "notes": [
             "value 为显示值（分流电流模式下是电流 A），overload=true 时 value 为 null。",
             "分流电流模式（display_mode=current）只能用 DCV 功能。",
+            "量程随功能不同：options.functions[].ranges 列出每个功能可选量程，fixed_range 表示固定量程。",
+            "通断阈值（cont_threshold，1~1000 Ω）只在 CONT 功能下可设，低于阈值判定为导通。",
             "切换功能/量程后读数需要时间稳定，measure/setup 的 settle 参数用于等待。",
             "错误统一返回 {ok:false, error, code}，code 例如 offline/busy/timeout/local_mode/bad_value/mode_conflict。",
         ],
@@ -1598,7 +1719,8 @@ def api_agent_setup():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return _api_error("请求必须是 JSON 对象", "bad_request")
-    known = {"function", "range", "rate", "trigger", "display_mode", "shunt_ohm", "settle"}
+    known = {"function", "range", "rate", "trigger", "display_mode", "shunt_ohm",
+             "cont_threshold", "settle"}
     unknown = sorted(set(data) - known)
     if unknown:
         return _api_error(f"未知参数：{', '.join(unknown)}", "bad_request")
@@ -1637,8 +1759,20 @@ def api_agent_setup():
             applied.append("function")
         if data.get("range") is not None:
             rng = str(data["range"]).upper()
-            dmm.set_range("AUTO" if rng in ("AUTO", "R0") else rng)
+            rng = "AUTO" if rng in ("AUTO", "R0") else rng
+            check_range_for_function(dmm.status_snapshot().get("function"), rng)
+            dmm.set_range(rng)
             applied.append("range")
+        if data.get("cont_threshold") is not None:
+            th = data["cont_threshold"]
+            if not _valid_number(th) or not (1 <= float(th) <= 1000):
+                raise ValueError("cont_threshold 必须在 1 ~ 1000 Ω 之间")
+            if dmm.status_snapshot().get("function") != "CONT":
+                raise ValueError("通断阈值只在通断功能（CONT）下设置")
+            dmm.send_command(f"KOM{int(round(float(th)))}")
+            h.cont_threshold = int(round(float(th)))
+            refresh_cont_threshold()
+            applied.append("cont_threshold")
         if data.get("rate") is not None:
             dmm.set_rate(str(data["rate"]))
             applied.append("rate")

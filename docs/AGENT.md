@@ -91,6 +91,8 @@ agent 可以直接这样用：「把万用表切到四线电阻，等 1 秒，�
 
 - `display_mode` 取 `voltage` 或 `current`。`current` 会强制切到 DCV，此时请求非 DCV 的 `function` 会返回 409。
 - `shunt_ohm` 是分流电阻，范围 1e-6 到 1e6 Ω。
+- `range` 可选值因功能而异：电压 R3–R7（100 mV–1000 V），电阻 R3–R9（100 Ω–100 MΩ），电流 R4–R8（1000 µA–3 A）。DCV Bch、二极管、通断为固定量程。`GET /api/meta` 的 `functions[].ranges` 列出每个功能的可选量程，传入不适用的量程会返回 400。
+- `cont_threshold` 是通断阈值（1–1000 Ω 的整数），只能在 CONT 功能下设置。CONT 下的读数会带 `continuity`（是否导通）和 `cont_threshold`。
 - `settle` 大于 0 时，等待该秒数后在 `reading` 里返回一个新读数。
 
 ### `POST /api/agent/measure`

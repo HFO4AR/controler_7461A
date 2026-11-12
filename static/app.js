@@ -132,6 +132,17 @@
     return state.meta && state.meta.functions.find(x => x.code === code);
   }
 
+  // 功能配置（后端 FUNCTION_PROFILES）：可用量程与功能专属设置
+  function fnFeatures(code) {
+    const f = fnMeta(code || state.instrument.function || 'DCV');
+    return (f && f.features) || [];
+  }
+  function hasFeature(name, code) { return fnFeatures(code).includes(name); }
+  function fixedRange(code) {
+    const f = fnMeta(code || state.instrument.function || 'DCV');
+    return f && f.fixed_range ? f.fixed_range : null;
+  }
+
   const UNIT_NAMES = { V: '电压', A: '电流', 'Ω': '电阻', Hz: '频率' };
 
   function functionBaseUnit() {
@@ -380,16 +391,19 @@
       const el = $(id);
       if (el && !el.classList.contains('pending')) el.disabled = offline || state.switching;
     }
+    if (fixedRange()) $('rangeSelect').disabled = true;
     for (const id of ['itValue', 'itUnit', 'itApply']) {
       const el = $(id);
       if (el && !el.classList.contains('is-busy')) el.disabled = offline;
     }
     for (const b of $('fnList').querySelectorAll('.fn-item')) b.disabled = offline;
+    const fixed = fixedRange();
     $('controlHint').textContent = offline
       ? '设备离线，设置不可用。'
       : (state.config.display_mode === 'current'
           ? '分流电流模式使用 DCV 档；点击其它功能会自动退出分流模式。'
-          : '选择后立即生效，以仪器回读值为准。');
+          : (fixed ? `${funcLabel(state.instrument.function)}量程固定为 ${fixed}。`
+                   : '选择后立即生效，以仪器回读值为准。'));
     if (st === 'online' && itLastDeviceState !== 'online') {
       itLastDeviceState = 'online';
       loadIntegrationTime();
@@ -631,6 +645,23 @@
     }
     setText('displayState', stateText);
 
+    // 通断判定：电阻低于阈值 → 导通
+    const judge = $('contJudge');
+    if (code === 'CONT') {
+      judge.classList.remove('hidden');
+      const thr = state.contThreshold;
+      let pass = null;
+      if (s && !state.switching) {
+        pass = !s.ol && s.v !== null && s.v !== undefined && thr ? s.v < thr : (s.ol ? false : null);
+      }
+      judge.classList.toggle('pass', pass === true);
+      judge.classList.toggle('open', pass === false);
+      setText('contJudgeText', pass === true ? '导通' : pass === false ? '断开' : '—');
+      setText('contJudgeSub', thr ? `阈值 < ${thr} Ω` : '阈值读取中');
+    } else {
+      judge.classList.add('hidden');
+    }
+
     const showBurden = state.config.display_mode === 'current';
     $('burdenItem').classList.toggle('hidden', !showBurden);
     $('shuntItem').classList.toggle('hidden', !showBurden);
@@ -829,18 +860,19 @@
     sel.dataset.filled = '1';
   }
 
+  // 量程选项随功能变化（电压/电阻/电流各自的量程表；固定量程功能只显示一项）
   function buildRangeOptions() {
     if (!state.meta) return;
     const sel = $('rangeSelect');
-    const base = functionBaseUnit();
-    const modeKey = base === 'V' ? 'voltage' : 'generic';
-    if (sel.dataset.mode === modeKey) return;
-    sel.dataset.mode = modeKey;
+    const code = state.instrument.function || 'DCV';
+    if (sel.dataset.mode === code) return;
+    sel.dataset.mode = code;
     sel.innerHTML = '';
-    const items = modeKey === 'voltage'
-      ? state.meta.ranges
-      : [{ code: 'AUTO', label: '自动' },
-         ...['R3', 'R4', 'R5', 'R6', 'R7'].map(c => ({ code: c, label: '档位 ' + c.slice(1) }))];
+    const f = fnMeta(code);
+    const fixed = fixedRange(code);
+    const items = fixed
+      ? [{ code: '__fixed', label: fixed + '（固定）' }]
+      : (f && f.ranges && f.ranges.length ? f.ranges : state.meta.ranges);
     for (const it of items) {
       const opt = document.createElement('option');
       opt.value = it.code;
@@ -989,7 +1021,9 @@
 
     const inst = state.instrument || {};
     const rangeSel = $('rangeSelect');
-    if (inst.range && !rangeSel.classList.contains('pending')) {
+    if (fixedRange()) {
+      rangeSel.value = '__fixed';
+    } else if (inst.range && !rangeSel.classList.contains('pending')) {
       if (![...rangeSel.options].some(o => o.value === inst.range)) {
         const opt = document.createElement('option');
         opt.value = inst.range;
@@ -1004,7 +1038,220 @@
 
     renderFunctionActive();
     renderDevice();
+    applyFunctionLayout();
   }
+
+  // ---- 按功能显示/隐藏卡片与区块 ----------------------------------------
+  function revealToggle(el, on, animate) {
+    if (!el) return;
+    const wasHidden = el.classList.contains('hidden');
+    el.classList.toggle('hidden', !on);
+    if (on && wasHidden && animate) restartClass(el, 'fn-reveal');
+  }
+
+  function fnAdvItems(code) {
+    if (!adv.schema) return [];
+    const out = [];
+    for (const g of adv.schema) {
+      for (const it of g.items) {
+        if (it.key === 'cont_limit' || !Array.isArray(it.applies)) continue;
+        if (it.applies.includes(code) && (it.kind === 'select' || it.kind === 'number')) out.push(it);
+      }
+    }
+    return out;
+  }
+
+  function applyFunctionLayout(force = false) {
+    if (!state.meta) return;
+    const code = state.instrument.function || 'DCV';
+    const shuntMode = state.config.display_mode === 'current';
+    const nullOn = !!(state.null && state.null.enabled);
+    const key = [code, shuntMode, nullOn, !!adv.schema, isOnline()].join('|');
+    if (!force && state.layoutKey === key) return;
+    const animate = state.layoutKey !== undefined;
+    const fnChanged = !state.layoutKey || state.layoutKey.split('|')[0] !== code;
+    state.layoutKey = key;
+
+    const showShunt = hasFeature('shunt', code) || shuntMode;
+    const showLimits = !!limitKey();
+    revealToggle($('shuntCard'), showShunt, animate);
+    revealToggle($('limitsCard'), showLimits, animate);
+    const two = $('twoCol');
+    two.classList.toggle('hidden', !showShunt && !showLimits);
+    two.classList.toggle('single', showShunt !== showLimits);
+
+    revealToggle($('itBlock'), hasFeature('integration', code), animate);
+    // NULL 已开启时始终显示，方便关闭
+    revealToggle($('nullBlock'), hasFeature('null', code) || nullOn, animate);
+
+    const isCont = code === 'CONT';
+    revealToggle($('contBlock'), isCont, animate);
+    const items = fnAdvItems(code);
+    if (fnChanged || force || !$('fnAdvList').children.length) renderFnAdvList(items);
+    const meta = fnMeta(code);
+    setText('fnSettingsTitle', (meta ? meta.label : code) + '设置');
+    setText('fnSettingsCode', code);
+    revealToggle($('fnSettingsCard'), isCont || items.length > 0, animate);
+    if (isCont && (fnChanged || !state.contThreshold)) loadContThreshold();
+    if (items.length && (fnChanged || force || !state.fnAdvLoaded)) loadFnAdvValues(items);
+    renderCont();
+  }
+
+  function renderFnAdvList(items) {
+    state.fnAdvLoaded = false;
+    const list = $('fnAdvList');
+    list.innerHTML = '';
+    for (const it of items) {
+      const row = document.createElement('div');
+      row.className = 'form-row';
+      const label = document.createElement('label');
+      label.textContent = it.label.replace(/（.*?）/, '').replace(/^DCV\s*/, '');
+      label.htmlFor = 'fnAdv_' + it.key;
+      row.appendChild(label);
+      if (it.kind === 'select') {
+        const sel = document.createElement('select');
+        sel.id = 'fnAdv_' + it.key;
+        sel.dataset.key = it.key;
+        const ph = document.createElement('option');
+        ph.value = ''; ph.textContent = '读取中…'; ph.disabled = true; ph.selected = true;
+        sel.appendChild(ph);
+        for (const [val, text] of it.options || []) {
+          const o = document.createElement('option');
+          o.value = val; o.textContent = text;
+          sel.appendChild(o);
+        }
+        sel.addEventListener('change', () => applyFnAdv(it, sel.value, sel));
+        row.appendChild(sel);
+      } else {
+        const wrap = document.createElement('div');
+        wrap.className = 'it-controls';
+        const inp = document.createElement('input');
+        inp.type = 'number'; inp.step = 'any'; inp.id = 'fnAdv_' + it.key;
+        inp.dataset.key = it.key;
+        if (it.hint) inp.placeholder = it.hint;
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-ghost btn-sm'; btn.textContent = '应用';
+        const go = () => {
+          const v = parseFloat(inp.value);
+          if (!Number.isFinite(v)) { markInvalid(inp, '请输入有效数字'); return; }
+          withBusy(btn, () => applyFnAdv(it, v, inp));
+        };
+        btn.addEventListener('click', go);
+        onEnter(inp, go);
+        wrap.append(inp);
+        if (it.unit) {
+          const u = document.createElement('span');
+          u.className = 'unit-fixed'; u.textContent = it.unit;
+          wrap.append(u);
+        }
+        wrap.append(btn);
+        row.appendChild(wrap);
+      }
+      list.appendChild(row);
+    }
+  }
+
+  async function loadFnAdvValues(items) {
+    if (!isOnline() || !items.length) return;
+    try {
+      const d = await api('/api/advanced/read?keys=' + encodeURIComponent(items.map(i => i.key).join(',')));
+      state.fnAdvLoaded = true;
+      for (const it of items) {
+        const el = $('fnAdv_' + it.key);
+        const v = d.values && d.values[it.key];
+        if (!el || !v || !v.ok) continue;
+        if (it.kind === 'select') {
+          const m = (it.options || []).find(([code]) => String(v.value).toUpperCase().startsWith(code));
+          if (m && !el.classList.contains('pending')) el.value = m[0];
+        } else {
+          const n = parseAdvNumber(v.value);
+          if (n !== null && document.activeElement !== el) el.placeholder = '当前 ' + trimNum(n);
+        }
+      }
+    } catch (_) { /* 回读失败时保持原样 */ }
+  }
+
+  async function applyFnAdv(item, value, el) {
+    if (!isOnline()) { showToast('设备未连接', 'error'); return; }
+    el.classList.add('pending');
+    el.disabled = true;
+    try {
+      await postJSON('/api/advanced/set', { key: item.key, value });
+      flashOk(el);
+      const opt = item.kind === 'select' && (item.options || []).find(o => o[0] === value);
+      showToast(item.label + ' 已设为 ' + (opt ? opt[1] : value + (item.unit || '')), 'ok');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      el.classList.remove('pending');
+      el.disabled = false;
+      loadFnAdvValues([item]);
+    }
+  }
+
+  // ---- 通断阈值 --------------------------------------------------------
+  function parseKom(v) {
+    const m = String(v || '').match(/KOM\s*\+?(\d+(?:\.\d+)?)/i) || String(v || '').match(/^\s*\+?(\d+(?:\.\d+)?)/);
+    return m ? Math.round(parseFloat(m[1])) : null;
+  }
+
+  async function loadContThreshold() {
+    if (!isOnline()) return;
+    try {
+      const d = await api('/api/advanced/read?keys=cont_limit');
+      const v = d.values && d.values.cont_limit;
+      if (v && v.ok) {
+        const n = parseKom(v.value);
+        if (n !== null) state.contThreshold = n;
+      }
+    } catch (_) { /* 保留缓存值 */ }
+    renderCont();
+    renderReadout();
+  }
+
+  function renderCont() {
+    const thr = state.contThreshold;
+    setText('contReadback', thr ? `当前：${thr} Ω` : '当前：—');
+    const online = isOnline();
+    for (const b of $('contPresets').querySelectorAll('button')) {
+      b.classList.toggle('active', Number(b.dataset.v) === thr);
+      b.disabled = !online;
+    }
+    if (!$('contApply').classList.contains('is-busy')) $('contApply').disabled = !online;
+    $('contValue').disabled = !online;
+    if (thr && document.activeElement !== $('contValue')) $('contValue').placeholder = String(thr);
+  }
+
+  async function applyContThreshold(raw) {
+    const input = $('contValue');
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < 1 || v > 1000 || Math.round(v) !== v) {
+      markInvalid(input, '阈值为 1 – 1000 的整数 Ω');
+      return;
+    }
+    if (!isOnline()) { showToast('设备未连接，无法设置通断阈值', 'error'); return; }
+    await withBusy($('contApply'), async () => {
+      try {
+        const d = await postJSON('/api/advanced/set', { key: 'cont_limit', value: v });
+        state.contThreshold = parseKom(d.value) || v;
+        input.value = '';
+        flashOk(input);
+        showToast(`通断阈值已设为 ${state.contThreshold} Ω`, 'ok');
+        if (advIsOpen()) loadAdvKeys(['cont_limit']);
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+    renderCont();
+    renderReadout();
+  }
+
+  $('contApply').addEventListener('click', () => applyContThreshold($('contValue').value));
+  onEnter($('contValue'), () => applyContThreshold($('contValue').value));
+  $('contPresets').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-v]');
+    if (b) applyContThreshold(b.dataset.v);
+  });
 
   function renderConfigUI() {
     const mode = state.config.display_mode;
@@ -1021,6 +1268,7 @@
     $('limitModeLabel').textContent = key === 'current' ? '作用量：电流'
       : key === 'voltage' ? '作用量：电压' : '作用量：—';
     renderDirty();
+    applyFunctionLayout();
   }
 
   // 未应用的修改：输入框描边 + 按钮呼吸提示
@@ -1141,6 +1389,7 @@
     if (d.config) state.config = d.config;
     if (d.limits) state.limits = d.limits;
     if (d.null) state.null = d.null;
+    if (d.cont_threshold !== undefined && d.cont_threshold !== null) state.contThreshold = d.cont_threshold;
     if (typeof d.alarm === 'string' && !state.switching) state.alarm = d.alarm;
     if (d.logging) state.logging = d.logging;
     if (d.stats && !state.switching) state.stats = d.stats;
@@ -1161,6 +1410,7 @@
     renderStats();
     renderReadout();
     renderNull();
+    applyFunctionLayout();
     chart.dirty = true;
     if (adv.schema && advIsOpen()
         && adv.fn !== state.instrument.function) {
@@ -2575,6 +2825,11 @@
     } catch (err) {
       showToast('加载功能表失败：' + err.message, 'error');
     }
+    // 功能专属设置（AC 滤波、输入阻抗等）来自高级设置表
+    api('/api/advanced').then((d) => {
+      if (!adv.schema) adv.schema = d.groups || [];
+      applyFunctionLayout(true);
+    }).catch(() => {});
 
     try {
       const st = await api('/api/state');

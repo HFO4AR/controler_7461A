@@ -339,6 +339,51 @@ class AppTests(unittest.TestCase):
         finally:
             mcp_server.http = orig
 
+    # -- 按功能区分的量程与设置 ------------------------------------------------
+    def test_function_profiles_and_ranges(self):
+        meta = self.json(self.client.get("/api/meta"))
+        fns = {f["code"]: f for f in meta["functions"]}
+        self.assertIn("shunt", fns["DCV"]["features"])
+        self.assertNotIn("shunt", fns["CONT"]["features"])
+        self.assertEqual(fns["CONT"]["fixed_range"], "1000 Ω")
+        self.assertIn("R9", [r["code"] for r in fns["RES2W"]["ranges"]])
+        self.assertNotIn("R3", [r["code"] for r in fns["DCI"]["ranges"]])
+
+        self.client.post("/api/control", json={"action": "function", "value": "RES2W"})
+        r = self.client.post("/api/control", json={"action": "range", "value": "R8"})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()["instrument"]["range_label"], "10 MΩ")
+        st = self.json(self.client.get("/api/state"))
+        self.assertEqual(st["instrument"]["range_label"], "10 MΩ")
+
+        self.client.post("/api/control", json={"action": "function", "value": "DCI"})
+        r = self.client.post("/api/control", json={"action": "range", "value": "R3"})
+        self.assertEqual(r.status_code, 400)
+
+        self.client.post("/api/control", json={"action": "function", "value": "CONT"})
+        r = self.client.post("/api/control", json={"action": "range", "value": "R4"})
+        self.assertEqual(r.status_code, 400)
+        self.client.post("/api/control", json={"action": "range", "value": "AUTO"})
+        self.client.post("/api/control", json={"action": "function", "value": "DCV"})
+
+    def test_cont_threshold(self):
+        r = self.client.post("/api/agent/setup", json={"function": "CONT", "cont_threshold": 25})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        st = self.json(self.client.get("/api/agent/status"))
+        self.assertEqual(st["cont_threshold"], 25)
+        self.assertEqual(self.json(self.client.get("/api/state"))["cont_threshold"], 25)
+        rd = self.json(self.client.get("/api/agent/reading?fresh=1"))["reading"]
+        self.assertIn("continuity", rd)
+        # 高级设置写入同样更新缓存
+        r = self.client.post("/api/advanced/set", json={"key": "cont_limit", "value": 40})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.json(self.client.get("/api/state"))["cont_threshold"], 40)
+        for bad in (0, 1001, "x"):
+            self.assertEqual(self.client.post(
+                "/api/agent/setup", json={"cont_threshold": bad}).status_code, 400)
+        r = self.client.post("/api/agent/setup", json={"function": "DCV", "cont_threshold": 10})
+        self.assertEqual(r.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()
