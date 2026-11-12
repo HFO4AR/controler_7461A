@@ -252,6 +252,13 @@ def _trigger_from_reply(reply: str):
     return f"TRS{int(m.group(1))}"
 
 
+def _parse_knl(reply: str | None):
+    if not reply:
+        return None
+    m = re.search(r"KNL\s*([+-]?\d+(?:\.\d*)?(?:[Ee][+-]?\d+)?)", reply, re.I)
+    return float(m.group(1)) if m else None
+
+
 # ---------------------------------------------------------------------------
 # 状态基类
 # ---------------------------------------------------------------------------
@@ -272,6 +279,8 @@ class _StateMixin:
             "rate_label": None,
             "trigger": None,
             "trigger_label": None,
+            "null": None,
+            "null_const": None,
         }
         self._on_sample = None
         self._on_status = None
@@ -395,17 +404,25 @@ class DMM7461A(_StateMixin):
             return
         self._last_local_sync = now
         before = self.snapshot()
-        fn = rg = rt = tr = None
+        fn = rg = rt = tr = nl = knl = None
+
+        def q(cmd, pattern, parser):
+            try:
+                return parser(self._query_locked(cmd, pattern, deadline=0.8))
+            except QueryTimeout:
+                return None
+
         try:
             _ren_control(self._fd, enable=True)
-            fn = _function_from_reply(self._query_locked("F?", r"^F\d+", deadline=0.8))
-            rg = _range_from_reply(self._query_locked("R?", r"^R\d+", deadline=0.8))
-            rt = _rate_from_reply(self._query_locked("PR?", r"^PR\d+", deadline=0.8))
-            tr = _trigger_from_reply(self._query_locked("TRS?", r"^TRS\d+", deadline=0.8))
-        except QueryTimeout:
-            LOG.debug("面板设置同步超时（可忽略）")
+            fn = q("F?", r"^F\d+", _function_from_reply)
+            rg = q("R?", r"^R\d+", _range_from_reply)
+            rt = q("PR?", r"^PR\d+", _rate_from_reply)
+            tr = q("TRS?", r"^TRS\d+", _trigger_from_reply)
+            nl = q("NL?", r"^NL\d", lambda r: r.strip().upper())
+            knl = q("KNL?", r"^KNL", _parse_knl)
         finally:
             self._auto_local_locked()
+
         fields = {}
         if fn and fn != before["function"]:
             fields["function"] = fn
@@ -415,8 +432,18 @@ class DMM7461A(_StateMixin):
             fields["rate"] = rt
         if tr and tr != before["trigger"]:
             fields["trigger"] = tr
+        if nl and nl != before["null"]:
+            fields["null"] = nl
+        if knl is not None and knl != before["null_const"]:
+            fields["null_const"] = knl
+        inst = {k: v for k, v in fields.items()
+                if k in ("function", "range", "rate", "trigger")}
+        extra = {k: v for k, v in fields.items() if k in ("null", "null_const")}
+        if inst:
+            self._apply_instrument(**inst)
+        if extra:
+            self._apply(**extra)
         if fields:
-            self._apply_instrument(**fields)
             self._publish_status()
             LOG.info("面板设置同步：%s", fields)
 
@@ -841,6 +868,18 @@ class DMM7461A(_StateMixin):
         rg_reply = self._query_locked("R?", r"^R\d+")
         rt_reply = self._query_locked("PR?", r"^PR\d+")
         tr_reply = self._query_locked("TRS?", r"^TRS\d+")
+        try:
+            nl_reply = self._query_locked("NL?", r"^NL\d")
+        except QueryTimeout:
+            nl_reply = None
+        try:
+            knl_reply = self._query_locked("KNL?", r"^KNL")
+        except QueryTimeout:
+            knl_reply = None
+        if nl_reply:
+            self._apply(null=nl_reply.strip().upper())
+        if knl_reply:
+            self._apply(null_const=_parse_knl(knl_reply))
         self._apply_instrument(
             function=_function_from_reply(fn_reply) or self.snapshot()["function"],
             range=_range_from_reply(rg_reply),
@@ -930,7 +969,8 @@ class SimulatedDMM(_StateMixin):
         self._ol = False
         self._adv: dict = {}
         self._apply_instrument(function="DCV", range="AUTO", rate="PR3", trigger="TRS0")
-        self._apply(idn="ADC Corp.,7461A,SIM0000000000,D00", serial="SIM0000000000")
+        self._apply(null="NL0", null_const=0.0,
+                    idn="ADC Corp.,7461A,SIM0000000000,D00", serial="SIM0000000000")
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -1024,6 +1064,14 @@ class SimulatedDMM(_StateMixin):
         if text.startswith("TRS"):
             self._apply_instrument(trigger=text)
             self._publish_status()
+        elif text.startswith("NL"):
+            self._apply(null=text.upper())
+            self._publish_status()
+        elif text.startswith("KNL"):
+            value = _parse_knl(text)
+            if value is not None:
+                self._apply(null_const=value)
+                self._publish_status()
         return {"ok": True}
 
     def query_command(self, text: str, first_message: bool = False) -> str:

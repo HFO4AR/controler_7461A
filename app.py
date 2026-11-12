@@ -126,10 +126,11 @@ ADVANCED_GROUPS = [
         "label": "计算",
         "items": [
             _adv("null", "NULL 相对值", "select", "NL{}", "NL?", options=[
-                ["NL0", "关"], ["NL1", "开"]]),
+                ["NL0", "关"], ["NL1", "开"]], state_after=True),
             _adv("null_const", "NULL 常数", "number", "KNL{}", "KNL?", fmt="sci",
                  action="null_from_latest", action_label="取当前读数",
-                 hint="NULL 关闭时常数无效；「取当前读数」会同时打开 NULL"),
+                 hint="NULL 关闭时常数无效；「取当前读数」会同时打开 NULL",
+                 state_after=True),
             _adv("smooth", "平滑", "select", "SM{}", "SM?", options=[
                 ["SM0", "关"], ["SM1", "开"]]),
             _adv("smooth_count", "平滑次数", "number", "TI{}", "TI?",
@@ -660,6 +661,11 @@ class Hub:
                     "idn": device.get("idn"),
                     "serial": device.get("serial"),
                 },
+                "null": {
+                    "enabled": device.get("null") == "NL1",
+                    "const": device.get("null_const"),
+                    "raw": device.get("null"),
+                },
                 "config": dict(self.config),
                 "limits": json.loads(json.dumps(self.limits)),
                 "alarm": self.last_alarm,
@@ -850,9 +856,23 @@ def hub() -> Hub:
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
+def _asset_version() -> str:
+    """静态资源版本号（取 CSS/JS 修改时间），避免浏览器混用新旧前端文件。"""
+    static = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    stamps = []
+    for name in ("app.js", "style.css"):
+        try:
+            stamps.append(int(os.path.getmtime(os.path.join(static, name))))
+        except OSError:
+            pass
+    return str(max(stamps)) if stamps else "0"
+
+
 @app.get("/")
 def index():
-    return render_template("index.html")
+    resp = app.make_response(render_template("index.html", asset_v=_asset_version()))
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.get("/api/health")
@@ -1189,14 +1209,23 @@ def api_advanced_set():
     dmm = hub().dmm
     try:
         dmm.send_command(cmd)
-        reply = (dmm.query_command(item["query"],
-                                   first_message=item.get("first_message", False))
-                 if item.get("query") else None)
-        if item.get("state_after"):
-            dmm.sync_state()
     except (dmm7461a.DMMError, ValueError) as exc:
         return _dmm_http_error(exc)
-    return jsonify({"ok": True, "sent": cmd, "value": reply})
+
+    reply = None
+    warning = None
+    try:
+        if item.get("query"):
+            reply = dmm.query_command(item["query"],
+                                      first_message=item.get("first_message", False))
+    except dmm7461a.DMMError:
+        warning = "设置已发送，但回读超时；稍后会自动同步"
+    if item.get("state_after"):
+        try:
+            dmm.sync_state()
+        except dmm7461a.DMMError:
+            warning = warning or "设置已发送，状态回读超时；稍后会自动同步"
+    return jsonify({"ok": True, "sent": cmd, "value": reply, "warning": warning})
 
 
 @app.post("/api/advanced/action")
@@ -1214,30 +1243,57 @@ def api_advanced_action():
 
     h = hub()
     dmm = h.dmm
+    warning = None
+    reference = None
     if action == "null_from_latest":
-        with h.lock:
-            latest = h.samples[-1] if h.samples else None
-        if not latest or latest.get("ol") or latest.get("v") is None:
-            return _api_error("当前没有有效读数，无法取当前值", "no_value", 409)
-        # 手册：NULL 计算关闭时 KNL 常数设置无效，先打开 NULL
+        # NULL 开启时数据流输出的是相对值，先关闭 NULL 取一次绝对读数，
+        # 再以该绝对读数作为参考重新开启 NULL。
         try:
-            dmm.send_command("NL1")
+            dmm.send_command("NL0")
         except (dmm7461a.DMMError, ValueError) as exc:
             return _dmm_http_error(exc)
+        with h.lock:
+            before_seq = h.seq
+        time.sleep(0.8)
+        with h.lock:
+            latest = h.samples[-1] if h.samples else None
+            latest_seq = latest["seq"] if latest else 0
+        if not latest or latest.get("ol") or latest.get("v") is None:
+            try:
+                dmm.send_command("NL1")
+            except (dmm7461a.DMMError, ValueError):
+                pass
+            return _api_error("当前没有有效读数，无法取当前值", "no_value", 409)
+        reference = latest["v"]
         cmd = f"KNL{latest['v']:.9E}"
+        try:
+            dmm.send_command("NL1")
+            dmm.send_command(cmd)
+        except (dmm7461a.DMMError, ValueError) as exc:
+            return _dmm_http_error(exc)
+        if latest_seq <= before_seq:
+            warning = "等待绝对读数超时，已按最近一次读数设置"
     else:
         cmd = action
+        try:
+            dmm.send_command(cmd)
+        except (dmm7461a.DMMError, ValueError) as exc:
+            return _dmm_http_error(exc)
 
+    reply = None
     try:
-        dmm.send_command(cmd)
-        reply = (dmm.query_command(item["query"],
-                                   first_message=item.get("first_message", False))
-                 if item.get("query") else None)
-        if item.get("state_after"):
+        if item.get("query"):
+            reply = dmm.query_command(item["query"],
+                                      first_message=item.get("first_message", False))
+    except dmm7461a.DMMError:
+        warning = warning or "动作已执行，但回读超时；稍后会自动同步"
+    if item.get("state_after"):
+        try:
             dmm.sync_state()
-    except (dmm7461a.DMMError, ValueError) as exc:
-        return _dmm_http_error(exc)
-    return jsonify({"ok": True, "sent": cmd, "value": reply})
+        except dmm7461a.DMMError:
+            warning = warning or "动作已执行，状态回读超时；稍后会自动同步"
+    return jsonify({"ok": True, "sent": cmd, "value": reply,
+                    "warning": warning, "reference": reference})
 
 
 @app.post("/api/dev/raw")
@@ -1272,6 +1328,337 @@ def api_dev_sim():
     if "disconnect" in data:
         result["disconnect"] = dmm.inject_disconnect(bool(data["disconnect"]))
     return jsonify({"ok": True, "result": result})
+
+
+# ---------------------------------------------------------------------------
+# Agent 接口：为 AI agent / 脚本设计的高层接口（一次调用完成“设置 → 等待 → 取数”）
+# 详见 docs/AGENT.md；MCP 服务器 mcp_server.py 也是基于这些接口。
+# ---------------------------------------------------------------------------
+AGENT_MAX_SAMPLES = 5000
+AGENT_MAX_WAIT = 120.0
+
+
+def _agent_reading(s: dict | None) -> dict | None:
+    """把内部采样转换为 agent 易读的结构。"""
+    if not s:
+        return None
+    return {
+        "seq": s["seq"],
+        "time": s["t"],
+        "age_s": round(max(0.0, time.time() - s["t"]), 3),
+        "value": None if s.get("ol") else s.get("d"),
+        "unit": s.get("u"),
+        "overload": bool(s.get("ol")),
+        "raw_value": s.get("v"),
+        "raw_unit": s.get("fu"),
+        "current_a": s.get("i"),
+        "function": s.get("fn"),
+        "range": s.get("rng"),
+        "rate": s.get("rate"),
+        "alarm": s.get("alarm"),
+        "context_id": s.get("ctx"),
+    }
+
+
+def _agent_summary(values: list, n_ol: int, unit) -> dict:
+    n = len(values)
+    if not n:
+        return {"n": 0, "n_ol": n_ol, "unit": unit, "mean": None, "std": None,
+                "min": None, "max": None, "pp": None, "rms": None}
+    mean = sum(values) / n
+    var = sum((x - mean) ** 2 for x in values) / (n - 1) if n > 1 else 0.0
+    return {
+        "n": n,
+        "n_ol": n_ol,
+        "unit": unit,
+        "mean": mean,
+        "std": math.sqrt(var),
+        "min": min(values),
+        "max": max(values),
+        "pp": max(values) - min(values),
+        "rms": math.sqrt(sum(x * x for x in values) / n),
+    }
+
+
+def _agent_float(data: dict, key: str, default, lo: float, hi: float):
+    value = data.get(key, default)
+    if value is None:
+        return None
+    if not _valid_number(value):
+        raise ValueError(f"{key} 必须是数字")
+    value = float(value)
+    if not (lo <= value <= hi):
+        raise ValueError(f"{key} 必须在 {lo:g} ~ {hi:g} 之间")
+    return value
+
+
+def _latest_seq() -> int:
+    h = hub()
+    with h.lock:
+        return h.seq
+
+
+def _wait_samples(after_seq: int, count: int | None, seconds: float | None,
+                  timeout: float) -> tuple[list, bool]:
+    """收集 seq > after_seq 的新样本，直到凑够 count 个或经过 seconds 秒。
+
+    返回 (样本列表, 是否超时)。只保留最后一个上下文（功能/单位）内的样本，
+    避免把切换前后的读数混在一起。
+    """
+    h = hub()
+    start = time.monotonic()
+    deadline = start + timeout
+    end_at = start + seconds if seconds else None
+    collected: list = []
+    last = after_seq
+    timed_out = False
+    while True:
+        with h.lock:
+            fresh = [s for s in h.samples if s["seq"] > last] if h.seq > last else []
+        if fresh:
+            last = fresh[-1]["seq"]
+            collected.extend(fresh)
+            ctx = collected[-1]["ctx"]
+            if collected[0]["ctx"] != ctx:
+                collected = [s for s in collected if s["ctx"] == ctx]
+        now = time.monotonic()
+        if count and len(collected) >= count:
+            collected = collected[:count]
+            break
+        if end_at is not None and now >= end_at:
+            break
+        if now >= deadline:
+            timed_out = True
+            break
+        time.sleep(0.02)
+    return collected[:AGENT_MAX_SAMPLES], timed_out
+
+
+def _agent_status() -> dict:
+    st = hub().state()
+    with hub().lock:
+        latest = hub().samples[-1] if hub().samples else None
+    stats = st["stats"]
+    return {
+        "device": {
+            "state": st["device"].get("state"),
+            "message": st["device"].get("message"),
+            "simulator": st["sim"],
+            "idn": st["instrument"].get("idn"),
+        },
+        "instrument": st["instrument"],
+        "null": st["null"],
+        "config": st["config"],
+        "limits": st["limits"],
+        "alarm": st["alarm"],
+        "logging": st["logging"],
+        "latest": _agent_reading(latest),
+        "stats": stats,
+        "context_id": st["context_id"],
+    }
+
+
+@app.get("/api/agent")
+def api_agent_manifest():
+    """自描述清单：agent 先读这个就知道能做什么、参数取值范围是什么。"""
+    return jsonify({
+        "name": "ADCMT 7461A 数字万用表",
+        "description": "通过本上位机控制 7461A 并读取测量数据。所有设置会同步到网页界面。",
+        "docs": "docs/AGENT.md",
+        "endpoints": [
+            {"method": "GET", "path": "/api/agent", "desc": "本清单"},
+            {"method": "GET", "path": "/api/agent/status", "desc": "设备、设置、报警、记录、最新读数、统计"},
+            {"method": "GET", "path": "/api/agent/reading",
+             "desc": "最新读数；fresh=1 时等待一个新样本（timeout 秒，默认 5）"},
+            {"method": "POST", "path": "/api/agent/measure",
+             "desc": "采集新样本并返回统计：{count|seconds, settle, timeout, include_samples}"},
+            {"method": "POST", "path": "/api/agent/setup",
+             "desc": "一次设置 {function, range, rate, trigger, display_mode, shunt_ohm}，可带 settle 后读一次"},
+            {"method": "GET", "path": "/api/history", "desc": "历史样本 ?seconds=60"},
+            {"method": "POST", "path": "/api/limits", "desc": "上下限报警 {mode, enabled, low, high}"},
+            {"method": "POST", "path": "/api/stats/reset", "desc": "重置统计"},
+            {"method": "POST", "path": "/api/log/start", "desc": "开始 CSV 记录"},
+            {"method": "POST", "path": "/api/log/stop", "desc": "停止 CSV 记录"},
+            {"method": "GET", "path": "/api/logs", "desc": "记录文件列表"},
+            {"method": "GET", "path": "/api/logs/<name>/download", "desc": "下载 CSV"},
+            {"method": "GET", "path": "/api/advanced", "desc": "高级设置项清单"},
+            {"method": "GET", "path": "/api/advanced/read", "desc": "读高级设置 ?keys=a,b"},
+            {"method": "POST", "path": "/api/advanced/set", "desc": "写高级设置 {key, value}"},
+            {"method": "POST", "path": "/api/advanced/action", "desc": "执行动作 {key}"},
+            {"method": "POST", "path": "/api/device/reconnect", "desc": "强制重连"},
+        ],
+        "options": META,
+        "notes": [
+            "value 为显示值（分流电流模式下是电流 A），overload=true 时 value 为 null。",
+            "分流电流模式（display_mode=current）只能用 DCV 功能。",
+            "切换功能/量程后读数需要时间稳定，measure/setup 的 settle 参数用于等待。",
+            "错误统一返回 {ok:false, error, code}，code 例如 offline/busy/timeout/local_mode/bad_value/mode_conflict。",
+        ],
+    })
+
+
+@app.get("/api/agent/status")
+def api_agent_status():
+    return jsonify({"ok": True, **_agent_status()})
+
+
+@app.get("/api/agent/reading")
+def api_agent_reading():
+    fresh = request.args.get("fresh", "0").lower() in ("1", "true", "yes")
+    try:
+        raw = request.args.get("timeout")
+        timeout = _agent_float({"timeout": float(raw) if raw else 5}, "timeout",
+                               5, 0.1, AGENT_MAX_WAIT)
+    except ValueError as exc:
+        if "timeout" not in str(exc):
+            exc = ValueError("timeout 必须是数字")
+        return _api_error(str(exc), "bad_value")
+    h = hub()
+    if fresh:
+        samples, timed_out = _wait_samples(_latest_seq(), 1, None, timeout)
+        if timed_out or not samples:
+            return _api_error(f"{timeout:g} 秒内没有收到新读数", "no_data", 504)
+        sample = samples[-1]
+    else:
+        with h.lock:
+            sample = h.samples[-1] if h.samples else None
+        if sample is None:
+            return _api_error("还没有读数", "no_data", 409)
+    return jsonify({"ok": True, "reading": _agent_reading(sample),
+                    "device_state": h.dmm.status_snapshot().get("state") if h.dmm else None})
+
+
+@app.post("/api/agent/measure")
+def api_agent_measure():
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return _api_error("请求必须是 JSON 对象", "bad_request")
+    try:
+        count = data.get("count")
+        if count is not None:
+            if isinstance(count, bool) or not isinstance(count, (int, float)) or int(count) != count:
+                raise ValueError("count 必须是整数")
+            count = int(count)
+            if not (1 <= count <= AGENT_MAX_SAMPLES):
+                raise ValueError(f"count 必须在 1 ~ {AGENT_MAX_SAMPLES} 之间")
+        seconds = _agent_float(data, "seconds", None, 0.05, AGENT_MAX_WAIT)
+        if count is None and seconds is None:
+            count = 10
+        settle = _agent_float(data, "settle", 0, 0, 60)
+        default_timeout = (seconds or 0) + max(10.0, (count or 0) * 2.0)
+        timeout = _agent_float(data, "timeout", min(default_timeout, AGENT_MAX_WAIT),
+                               0.1, AGENT_MAX_WAIT + 60)
+    except ValueError as exc:
+        return _api_error(str(exc), "bad_value")
+
+    h = hub()
+    if h.dmm and h.dmm.status_snapshot().get("state") != "online":
+        return _api_error("设备离线，无法测量", "offline", 503)
+    if settle:
+        time.sleep(settle)
+    started = time.time()
+    samples, timed_out = _wait_samples(_latest_seq(), count, seconds, timeout)
+    if not samples:
+        return _api_error("等待期间没有收到读数", "no_data", 504)
+
+    values = [s["d"] for s in samples if not s.get("ol") and s.get("d") is not None]
+    n_ol = len(samples) - len(values)
+    last = samples[-1]
+    duration = samples[-1]["t"] - samples[0]["t"] if len(samples) > 1 else 0.0
+    result = {
+        "ok": True,
+        "complete": not timed_out,
+        "requested": {"count": count, "seconds": seconds, "settle": settle},
+        "summary": _agent_summary(values, n_ol, last.get("u")),
+        "function": last.get("fn"),
+        "range": last.get("rng"),
+        "rate": last.get("rate"),
+        "display_mode": h.config["display_mode"],
+        "context_id": last.get("ctx"),
+        "started": started,
+        "duration_s": duration,
+        "sample_rate_hz": (len(samples) - 1) / duration if duration > 0 else None,
+        "last": _agent_reading(last),
+    }
+    if timed_out:
+        result["warning"] = f"超时：只收到 {len(samples)} 个样本"
+    if data.get("include_samples"):
+        result["samples"] = [
+            {"t": s["t"], "value": None if s.get("ol") else s.get("d"),
+             "overload": bool(s.get("ol")), "alarm": s.get("alarm")}
+            for s in samples
+        ]
+    return jsonify(result)
+
+
+@app.post("/api/agent/setup")
+def api_agent_setup():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _api_error("请求必须是 JSON 对象", "bad_request")
+    known = {"function", "range", "rate", "trigger", "display_mode", "shunt_ohm", "settle"}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        return _api_error(f"未知参数：{', '.join(unknown)}", "bad_request")
+    try:
+        settle = _agent_float(data, "settle", 0, 0, 60)
+    except ValueError as exc:
+        return _api_error(str(exc), "bad_value")
+
+    h = hub()
+    dmm = h.dmm
+    applied = []
+    fn = str(data["function"]).upper() if data.get("function") is not None else None
+    mode = data.get("display_mode")
+    shunt = data.get("shunt_ohm")
+    target_mode = mode if mode is not None else h.config["display_mode"]
+    if mode is not None and mode not in ("voltage", "current"):
+        return _api_error("display_mode 只能是 voltage 或 current", "bad_value")
+    if shunt is not None and (not _valid_number(shunt)
+                              or not (SHUNT_MIN <= float(shunt) <= SHUNT_MAX)):
+        return _api_error(f"分流电阻必须在 {SHUNT_MIN:g} ~ {SHUNT_MAX:g} Ω 之间", "bad_value")
+    if target_mode == "current" and fn not in (None, "DCV"):
+        return _api_error("分流电流模式必须使用直流电压档（DCV）", "mode_conflict", 409)
+
+    try:
+        # 先切显示模式（进入分流模式会强制 DCV），再设置功能/量程/速率/触发
+        if mode is not None or shunt is not None:
+            if target_mode == "current":
+                if dmm.status_snapshot().get("state") != "online":
+                    return _api_error("设备离线，无法进入分流电流模式", "offline", 503)
+                dmm.set_function("DCV")
+            h.set_config(display_mode=target_mode,
+                         shunt_ohm=float(shunt) if shunt is not None else h.config["shunt_ohm"])
+            applied += [k for k in ("display_mode", "shunt_ohm") if data.get(k) is not None]
+        if fn is not None:
+            dmm.set_function(fn)
+            applied.append("function")
+        if data.get("range") is not None:
+            rng = str(data["range"]).upper()
+            dmm.set_range("AUTO" if rng in ("AUTO", "R0") else rng)
+            applied.append("range")
+        if data.get("rate") is not None:
+            dmm.set_rate(str(data["rate"]))
+            applied.append("rate")
+        if data.get("trigger") is not None:
+            dmm.set_trigger(str(data["trigger"]))
+            applied.append("trigger")
+    except (dmm7461a.DMMError, ValueError) as exc:
+        resp, status = _dmm_http_error(exc)
+        body = resp.get_json()
+        body["applied"] = applied
+        return jsonify(body), status
+
+    result = {"ok": True, "applied": applied}
+    if settle:
+        time.sleep(settle)
+        samples, _ = _wait_samples(_latest_seq(), 1, None, 10)
+        result["reading"] = _agent_reading(samples[-1]) if samples else None
+    result.update({k: v for k, v in _agent_status().items()
+                   if k in ("instrument", "config", "null", "device")})
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------

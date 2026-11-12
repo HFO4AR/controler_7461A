@@ -29,6 +29,12 @@
     limitsMode: null,
     lastLogsFetch: 0,
     statMetrics: null,
+    displayDigits: 7,
+    null: { enabled: false, const: null },
+    hold: null,            // 保持（HOLD）时冻结的样本
+    lastSampleAt: 0,       // 最近一次收到样本的本地时间 (ms)
+    sim: false,
+    knownLogs: null,
   };
 
   const STAT_DEFS = [
@@ -74,28 +80,35 @@
     [1e-3, 'm'], [1e-6, 'µ'], [1e-9, 'n'], [1e-12, 'p'],
   ];
 
+  // 工程计数法：按有效位数固定小数位，保留末尾的 0（如 12.50000 mV）
   function fmtEng(value, baseUnit, sig = 6) {
     if (value === null || value === undefined || !Number.isFinite(value)) {
       return { text: 'OL', unit: baseUnit };
     }
-    let factor = 1, prefix = '';
+    let idx = PREFIXES.findIndex(([f]) => f === 1);
     const abs = Math.abs(value);
     if (value !== 0) {
-      for (const [f, p] of PREFIXES) {
-        if (abs >= f) { factor = f; prefix = p; break; }
-      }
-      if (abs < 1e-12) { factor = 1e-12; prefix = 'p'; }
+      idx = PREFIXES.findIndex(([f]) => abs >= f);
+      if (idx < 0) idx = PREFIXES.length - 1;     // < 1 p
     }
-    const scaled = value / factor;
-    const a = Math.abs(scaled);
-    let digits;
-    if (a >= 100) digits = Math.max(0, sig - 3);
-    else if (a >= 10) digits = Math.max(0, sig - 2);
-    else digits = Math.max(0, sig - 1);
-    let text = scaled.toFixed(Math.min(digits, 9));
-    if (text.includes('.')) text = text.replace(/0+$/, '').replace(/\.$/, '');
-    if (text === '-0') text = '0';
-    return { text, unit: prefix + (baseUnit || '') };
+    const decimals = (a) => Math.min(9, Math.max(0,
+      sig - (a >= 100 ? 3 : a >= 10 ? 2 : 1)));
+    let scaled = value / PREFIXES[idx][0];
+    let digits = decimals(Math.abs(scaled));
+    let text = scaled.toFixed(digits);
+    // 四舍五入后可能进位（9.9999996 → 10.000000，999.99995 m → 1000.0000 m），重新定位数/词头
+    const r = Math.abs(Number(text));
+    if (r >= 1000 && idx > 0) {
+      idx -= 1;
+      scaled = value / PREFIXES[idx][0];
+      digits = decimals(Math.abs(Number(scaled.toFixed(digits + 3))));
+      text = scaled.toFixed(digits);
+    } else if (decimals(r) !== digits) {
+      digits = decimals(r);
+      text = scaled.toFixed(digits);
+    }
+    if (Number(text) === 0 && text.startsWith('-')) text = text.slice(1);
+    return { text, unit: PREFIXES[idx][1] + (baseUnit || '') };
   }
 
   function fmtR(ohm) {
@@ -154,13 +167,148 @@
     if (el && el.textContent !== text) el.textContent = text;
   }
 
+  // 堆叠式提示：相同消息合并计数，错误停留更久，点击可关闭
   function showToast(msg, kind = '') {
-    const el = $('toast');
-    el.textContent = msg;
-    el.className = 'toast ' + kind;
-    el.classList.remove('hidden');
-    clearTimeout(showToast.timer);
-    showToast.timer = setTimeout(() => el.classList.add('hidden'), 3200);
+    const stack = $('toastStack');
+    if (!stack) return;
+    const existing = [...stack.children].find(t =>
+      t.dataset.msg === msg && t.dataset.kind === kind && !t.classList.contains('leaving'));
+    let el = existing;
+    if (el) {
+      const n = (parseInt(el.dataset.count, 10) || 1) + 1;
+      el.dataset.count = String(n);
+      let c = el.querySelector('.count');
+      if (!c) { c = document.createElement('span'); c.className = 'count'; el.appendChild(c); }
+      c.textContent = '×' + n;
+    } else {
+      el = document.createElement('div');
+      el.className = 'toast ' + kind;
+      el.dataset.msg = msg;
+      el.dataset.kind = kind;
+      el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+      const span = document.createElement('span');
+      span.textContent = msg;
+      el.appendChild(span);
+      el.addEventListener('click', () => dismissToast(el));
+      stack.appendChild(el);
+      while (stack.children.length > 4) dismissToast(stack.firstElementChild, true);
+    }
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => dismissToast(el), kind === 'error' ? 5200 : 2600);
+  }
+
+  function dismissToast(el, immediate = false) {
+    if (!el || !el.parentNode) return;
+    clearTimeout(el._timer);
+    if (immediate || REDUCED_MOTION) { el.remove(); return; }
+    el.classList.add('leaving');
+    setTimeout(() => el.remove(), 220);
+  }
+
+  const REDUCED_MOTION = window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // 按钮请求中状态：防重复点击并显示旋转指示
+  async function withBusy(btn, fn) {
+    if (!btn || btn.classList.contains('is-busy')) return undefined;
+    const wasDisabled = btn.disabled;
+    btn.classList.add('is-busy');
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      return await fn();
+    } finally {
+      btn.classList.remove('is-busy');
+      btn.removeAttribute('aria-busy');
+      btn.disabled = wasDisabled;
+    }
+  }
+
+  function restartClass(el, cls) {
+    if (!el) return;
+    el.classList.remove(cls);
+    void el.offsetWidth;   // 触发重排以重新播放动画
+    el.classList.add(cls);
+  }
+
+  function flashOk(...els) {
+    for (const el of els) {
+      if (!el) continue;
+      restartClass(el, 'flash-ok');
+      setTimeout(() => el.classList.remove('flash-ok'), 950);
+    }
+  }
+
+  function markInvalid(el, msg) {
+    if (el) {
+      restartClass(el, 'invalid');
+      el.focus();
+      const clear = () => { el.classList.remove('invalid'); el.removeEventListener('input', clear); };
+      el.addEventListener('input', clear);
+      setTimeout(clear, 2400);
+    }
+    if (msg) showToast(msg, 'error');
+  }
+
+  function onEnter(el, fn) {
+    if (!el) return;
+    el.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.isComposing) {
+        ev.preventDefault();
+        fn();
+      }
+    });
+  }
+
+  function isOnline() {
+    return (state.device.state || 'offline') === 'online';
+  }
+
+  // 自定义确认框，替代 window.confirm
+  function confirmDialog(text, { title = '确认操作', ok = '确认执行' } = {}) {
+    return new Promise((resolve) => {
+      const layer = $('confirmLayer');
+      setText('confirmTitle', title);
+      setText('confirmText', text);
+      setText('confirmOk', ok);
+      layer.classList.remove('hidden');
+      const prevFocus = document.activeElement;
+      $('confirmCancel').focus();
+      const done = (val) => {
+        layer.classList.add('hidden');
+        $('confirmOk').removeEventListener('click', onOk);
+        $('confirmCancel').removeEventListener('click', onCancel);
+        layer.removeEventListener('click', onBackdrop);
+        document.removeEventListener('keydown', onKey, true);
+        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        resolve(val);
+      };
+      const onOk = () => done(true);
+      const onCancel = () => done(false);
+      const onBackdrop = (e) => { if (e.target === layer) done(false); };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); done(false); }
+      };
+      $('confirmOk').addEventListener('click', onOk);
+      $('confirmCancel').addEventListener('click', onCancel);
+      layer.addEventListener('click', onBackdrop);
+      document.addEventListener('keydown', onKey, true);
+    });
+  }
+
+  function fmtClock(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(h)}:${p(m)}:${p(s)}`;
+  }
+
+  function fmtAgo(ts) {
+    const d = Date.now() / 1000 - ts;
+    if (d < 60) return '刚刚';
+    if (d < 3600) return Math.floor(d / 60) + ' 分钟前';
+    if (d < 86400) return Math.floor(d / 3600) + ' 小时前';
+    return new Date(ts * 1000).toLocaleDateString('zh-CN');
   }
 
   async function api(path, opts = {}) {
@@ -219,14 +367,23 @@
       : st === 'connecting' ? 'connecting'
       : st === 'local' ? 'local' : 'offline');
     setText('statusText', text);
-    setText('deviceId', dev.idn || '--');
+    $('connPill').classList.toggle('is-offline', st === 'offline');
+    $('connPill').title = text;
+    setText('deviceId', dev.idn || '—');
+    setText('serverInfo', dev.serial
+      ? `设备 ${dev.serial} · ${state.sim ? '模拟器' : '真机'}`
+      : (state.sim ? '模拟器' : ''));
 
     const offline = st !== 'online';
+    $('readout').classList.toggle('offline', offline);
     for (const id of ['rangeSelect', 'rateSelect', 'triggerSelect']) {
       const el = $(id);
-      if (el) el.disabled = offline || state.switching;
+      if (el && !el.classList.contains('pending')) el.disabled = offline || state.switching;
     }
-    $('syncState').disabled = false;
+    for (const id of ['itValue', 'itUnit', 'itApply']) {
+      const el = $(id);
+      if (el && !el.classList.contains('is-busy')) el.disabled = offline;
+    }
     for (const b of $('fnList').querySelectorAll('.fn-item')) b.disabled = offline;
     $('controlHint').textContent = offline
       ? '设备离线，设置不可用。'
@@ -241,7 +398,41 @@
       const itEl = $('itReadback');
       if (itEl) itEl.textContent = '当前：—';
     }
+    renderNull();
     setZoomUI();
+  }
+
+  function renderNull() {
+    const info = (state.null && typeof state.null === 'object')
+      ? state.null : { enabled: false, const: null };
+    const online = (state.device.state || 'offline') === 'online';
+    const toggle = $('nullToggle');
+    const take = $('nullTake');
+    if (toggle) {
+      toggle.checked = !!info.enabled;
+      toggle.disabled = !online;
+    }
+    if (take && !take.classList.contains('is-busy')) take.disabled = !online;
+    setText('nullStateText', info.enabled ? '开启' : '关闭');
+    const badge = $('nullBadge');
+    if (badge) badge.classList.toggle('on', !!info.enabled);
+    const ref = $('nullRef');
+    if (!ref) return;
+    if (info.const === null || info.const === undefined) {
+      ref.textContent = '—';
+      return;
+    }
+    let value = Number(info.const);
+    let unit;
+    if (state.config.display_mode === 'current') {
+      const r = Number(state.config.shunt_ohm) || 1;
+      value = value / r;
+      unit = 'A';
+    } else {
+      unit = baseUnit();
+    }
+    const x = fmtEng(value, unit, state.displayDigits || 7);
+    ref.textContent = x.text + ' ' + x.unit;
   }
 
   async function loadIntegrationTime() {
@@ -254,9 +445,17 @@
     if (itLoading) return;
     itLoading = true;
     try {
-      const d = await api('/api/advanced/read?keys=itp,its');
+      const d = await api('/api/advanced/read?keys=itp,its,digits');
       const itp = d.values && d.values.itp;
       const its = d.values && d.values.its;
+      const digits = d.values && d.values.digits;
+      if (digits && digits.ok) {
+        const m = String(digits.value).match(/RE(\d)/i);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          state.displayDigits = ({ 3: 4, 4: 5, 5: 6, 6: 7 })[n] || 7;
+        }
+      }
       const parts = [];
       if (itp && itp.ok) {
         const n = parseAdvNumber(itp.value);
@@ -279,9 +478,10 @@
       showToast('设备未连接，无法设置积分时间', 'error');
       return;
     }
-    const value = parseFloat($('itValue').value);
+    const input = $('itValue');
+    const value = parseFloat(input.value);
     if (!Number.isFinite(value)) {
-      showToast('请输入有效的积分时间', 'error');
+      markInvalid(input, '请输入有效的积分时间');
       return;
     }
     const unit = $('itUnit').value;
@@ -289,38 +489,114 @@
     const min = unit === 'plc' ? 0.02 : 0.00001;
     const max = unit === 'plc' ? 100 : 10;
     if (value < min || value > max) {
-      showToast(`范围 ${min} – ${max} ${unit === 'plc' ? 'PLC' : 's'}`, 'error');
+      markInvalid(input, `范围 ${min} – ${max} ${unit === 'plc' ? 'PLC' : 's'}`);
       return;
     }
-    const btn = $('itApply');
-    btn.disabled = true;
-    try {
-      await postJSON('/api/advanced/set', { key, value });
-      showToast('积分时间已设置，已切换为自由采样', 'ok');
-      await loadIntegrationTime();
-      if (!$('advDrawer').classList.contains('hidden')) loadAdvKeys(['itp', 'its']);
-    } catch (err) {
-      showToast(err.message, 'error');
-    } finally {
-      btn.disabled = false;
-    }
+    await withBusy($('itApply'), async () => {
+      try {
+        await postJSON('/api/advanced/set', { key, value });
+        showToast('积分时间已设置，已切换为自由采样', 'ok');
+        flashOk(input);
+        await loadIntegrationTime();
+        if (advIsOpen()) loadAdvKeys(['itp', 'its']);
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
   }
 
   $('itApply').addEventListener('click', applyIntegrationTime);
+  onEnter($('itValue'), applyIntegrationTime);
   $('itUnit').addEventListener('change', () => {
     $('itValue').placeholder = $('itUnit').value === 'plc' ? '如 1.5' : '如 0.02';
   });
 
+  $('nullToggle').addEventListener('change', async () => {
+    if ((state.device.state || 'offline') !== 'online') {
+      renderNull();
+      showToast('设备未连接，无法设置 NULL', 'error');
+      return;
+    }
+    const enable = $('nullToggle').checked;
+    $('nullToggle').disabled = true;
+    if ($('nullTake')) $('nullTake').disabled = true;
+    try {
+      if (enable) {
+        const d = await postJSON('/api/advanced/action', { key: 'null_const' });
+        state.null = {
+          enabled: true,
+          const: (d.reference !== undefined && d.reference !== null)
+            ? d.reference : (state.null && state.null.const),
+        };
+        showToast(d.warning ? 'NULL 已启用（回读稍后同步）'
+          : 'NULL 已启用，当前读数已设为参考', 'ok');
+      } else {
+        const d = await postJSON('/api/advanced/set', { key: 'null', value: 'NL0' });
+        state.null = { enabled: false, const: state.null && state.null.const };
+        showToast(d.warning ? 'NULL 已关闭（回读稍后同步）' : 'NULL 已关闭', 'ok');
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      renderNull();
+      renderDevice();
+    }
+  });
+
+  $('nullTake').addEventListener('click', async () => {
+    if ((state.device.state || 'offline') !== 'online') {
+      showToast('设备未连接，无法设置 NULL', 'error');
+      return;
+    }
+    const btn = $('nullTake');
+    if ($('nullToggle')) $('nullToggle').disabled = true;
+    await withBusy(btn, async () => {
+      try {
+        const d = await postJSON('/api/advanced/action', { key: 'null_const' });
+        state.null = {
+          enabled: true,
+          const: (d.reference !== undefined && d.reference !== null)
+            ? d.reference : (state.null && state.null.const),
+        };
+        showToast(d.warning ? '已重新取参考（回读稍后同步）'
+          : '已把当前读数设为 NULL 参考', 'ok');
+        flashOk($('nullRef'));
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+    renderNull();
+    renderDevice();
+  });
+
+  function readoutText(s) {
+    if (!s) return null;
+    if (s.ol || s.d === null || s.d === undefined) return 'OL';
+    const v = fmtEng(s.d, s.u || baseUnit(), state.displayDigits || 7);
+    return v.text + ' ' + v.unit;
+  }
+
   function renderReadout(sample) {
-    const s = sample || state.latest;
+    const s = state.hold || sample || state.latest;
     const unitBase = baseUnit();
     const readout = $('readout');
-    const alarm = (s && s.alarm) || state.alarm || 'off';
-    readout.classList.toggle('alarm', alarm === 'low' || alarm === 'high' || alarm === 'ol');
+    const alarm = state.hold ? (state.hold.alarm || 'off') : ((s && s.alarm) || state.alarm || 'off');
+    const alarming = alarm === 'low' || alarm === 'high' || alarm === 'ol';
+    readout.classList.toggle('alarm', alarming && !state.hold);
+    readout.classList.toggle('hold', !!state.hold);
+    readout.classList.toggle('switching', !!state.switching);
+    $('alarmAnn').classList.toggle('on', alarming);
+    $('holdBadge').classList.toggle('on', !!state.hold);
+    document.body.classList.toggle('mode-current', state.config.display_mode === 'current');
 
     const code = state.instrument.function || (s && s.fn) || 'DCV';
     const meta = fnMeta(code);
-    setText('pageTitle', meta ? meta.label : (state.instrument.function_label || '—'));
+    const title = meta ? meta.label : (state.instrument.function_label || '—');
+    const h1 = $('pageTitle');
+    if (h1.textContent !== title) {
+      h1.textContent = title;
+      restartClass(h1, 'swap');
+    }
     setText('pageCode', code);
     setText('pageNote', meta ? (meta.note || '') : '');
 
@@ -329,10 +605,31 @@
     badge.textContent = state.config.display_mode === 'current' ? '分流电流' : uName;
     badge.className = 'badge ' + (unitBase === 'A' ? 'badge-current' : 'badge-voltage');
 
-    setText('rangeLabel', state.instrument.range_label || '—');
+    const range = state.instrument.range;
+    setText('rangeLabel', range === 'AUTO' ? 'AUTO'
+      : (state.instrument.range_label ? 'RNG ' + state.instrument.range_label : '—'));
     setText('rateLabel', state.instrument.rate_label || '—');
-    setText('triggerLabel', state.instrument.trigger_label || '—');
+    setText('triggerLabel', state.instrument.trigger_label
+      ? 'TRIG ' + state.instrument.trigger_label : '—');
     setText('shuntInfo', fmtR(state.config.shunt_ohm));
+
+    // 显示屏状态行
+    let stateText = '';
+    readout.classList.remove('stale');
+    if (!isOnline()) {
+      stateText = state.serverOnline ? '设备未连接 · 等待重连' : '服务器未连接';
+    } else if (state.switching) {
+      stateText = '切换中…';
+    } else if (state.hold) {
+      stateText = 'HOLD · ' + timeStr(state.hold.t) + ' · 再按 H 释放';
+    } else if (state.lastSampleAt && Date.now() - state.lastSampleAt > staleLimitMs()) {
+      readout.classList.add('stale');
+      stateText = '无新数据 · ' + Math.round((Date.now() - state.lastSampleAt) / 1000) + ' s'
+        + (state.instrument.trigger && state.instrument.trigger !== 'TRS0' ? ' · 等待触发' : '');
+    } else if (s && s.t) {
+      stateText = timeStr(s.t);
+    }
+    setText('displayState', stateText);
 
     const showBurden = state.config.display_mode === 'current';
     $('burdenItem').classList.toggle('hidden', !showBurden);
@@ -350,7 +647,7 @@
       setText('valueText', 'OL');
       setText('unitText', s.u || unitBase);
     } else {
-      const v = fmtEng(s.d, s.u || unitBase, 7);
+      const v = fmtEng(s.d, s.u || unitBase, state.displayDigits || 7);
       setText('valueText', v.text);
       setText('unitText', v.unit);
     }
@@ -361,6 +658,11 @@
       setText('burdenText', b.text + ' ' + b.unit);
     }
     setAlarmBanner(alarm);
+  }
+
+  function staleLimitMs() {
+    const rate = Number((state.stats || {}).rate_hz) || 0;
+    return Math.max(3000, rate > 0 ? 5000 / rate : 0);
   }
 
   function setAlarmBanner(alarm) {
@@ -386,7 +688,7 @@
       if (alarm === 'ol') { text = '超量程'; cls = 'tag alarm'; }
       else if (alarm === 'low') { text = '低于下限'; cls = 'tag alarm'; }
       else if (alarm === 'high') { text = '高于上限'; cls = 'tag alarm'; }
-      else { text = '正常'; }
+      else { text = '正常'; cls = 'tag ok'; }
     }
     tag.textContent = text;
     tag.className = cls;
@@ -426,20 +728,42 @@
     const grid = $('statsGrid');
     if (grid) {
       if (!metrics.length) {
-        grid.innerHTML = '<div class="adv-note">请点击「设置」选择统计项</div>';
+        grid.innerHTML = '<div class="stats-empty">未选择统计项，点击「选择统计项」添加</div>';
+      } else if (grid.dataset.keys === metrics.join(',')) {
+        // 统计项未变：只更新数值，避免整块重建引起闪烁
+        for (const b of grid.querySelectorAll('b[data-key]')) {
+          const def = STAT_DEFS.find(d => d.key === b.dataset.key);
+          const txt = def ? formatStat(def, st, unit) : '—';
+          if (b.textContent !== txt) { b.textContent = txt; b.title = txt; }
+        }
       } else {
         grid.innerHTML = metrics.map(key => {
           const def = STAT_DEFS.find(d => d.key === key);
           if (!def) return '';
-          return `<div class="stat"><label>${def.label}</label><b>${formatStat(def, st, unit)}</b></div>`;
+          const txt = formatStat(def, st, unit);
+          return `<div class="stat"><label>${def.label}</label><b data-key="${key}" title="${txt}">${txt}</b></div>`;
         }).join('');
       }
+      grid.dataset.keys = metrics.length ? metrics.join(',') : '';
     }
     setText('sampleCount', String(st.n_total || 0));
     const rate = st.rate_hz;
-    const online = (state.device.state || 'offline') === 'online';
-    setText('sampleRate', rate ? `${Math.round(rate)} 样本/秒`
-      : (online ? '等待数据' : '—'));
+    const online = isOnline();
+    setText('sampleRate', rate ? `${rate >= 10 ? Math.round(rate) : Number(rate).toFixed(1)} S/s`
+      : (online ? '—' : ''));
+
+    // 副显示：MIN / AVG / MAX / P-P
+    const sub = (key, id) => {
+      const def = STAT_DEFS.find(d => d.key === key);
+      setText(id, def ? formatStat(def, st, unit) : '—');
+    };
+    sub('min', 'subMin');
+    sub('avg', 'subAvg');
+    sub('max', 'subMax');
+    sub('pp', 'subPp');
+    setText('statsSince', st.since && st.n_total
+      ? `自 ${new Date(st.since * 1000).toLocaleTimeString('zh-CN', { hour12: false })} 起`
+      : '');
     if ($('statsConfigCount')) {
       $('statsConfigCount').textContent = `${metrics.length} / ${STAT_DEFS.length} 项`;
     }
@@ -543,6 +867,7 @@
         btn.type = 'button';
         btn.className = 'fn-item';
         btn.dataset.code = code;
+        btn.title = f.note || f.label;
         btn.innerHTML = `<span class="fn-name">${f.label}</span>`
           + `<span class="fn-unit">${f.unit}</span>`
           + `<span class="fn-code">${f.code}</span>`;
@@ -558,6 +883,8 @@
     const offline = (state.device.state || 'offline') !== 'online';
     for (const btn of $('fnList').querySelectorAll('.fn-item')) {
       btn.classList.toggle('active', btn.dataset.code === active);
+      btn.classList.toggle('pending', state.switching && btn.dataset.code === active);
+      btn.setAttribute('aria-pressed', btn.dataset.code === active ? 'true' : 'false');
       btn.disabled = offline;
     }
   }
@@ -567,6 +894,8 @@
       showToast('设备离线，无法切换功能', 'error');
       return;
     }
+    if (code === state.instrument.function && !state.switching) return;
+    if (state.hold) setHold(false, true);
     const token = ++state.switchSeq;
     const meta = fnMeta(code);
     const needExitShunt = state.config.display_mode === 'current' && code !== 'DCV';
@@ -646,6 +975,7 @@
         state.switching = false;
         renderFunctionActive();
         renderDevice();
+        renderReadout();
       }
     }
   }
@@ -659,7 +989,7 @@
 
     const inst = state.instrument || {};
     const rangeSel = $('rangeSelect');
-    if (inst.range) {
+    if (inst.range && !rangeSel.classList.contains('pending')) {
       if (![...rangeSel.options].some(o => o.value === inst.range)) {
         const opt = document.createElement('option');
         opt.value = inst.range;
@@ -668,14 +998,9 @@
       }
       rangeSel.value = inst.range;
     }
-    if (inst.rate) $('rateSelect').value = inst.rate;
-    if (inst.trigger) $('triggerSelect').value = inst.trigger;
-
-    const chips = [];
-    if (inst.range_label) chips.push(`<span class="tag">量程 ${inst.range_label}</span>`);
-    if (inst.rate_label) chips.push(`<span class="tag">速率 ${inst.rate_label}</span>`);
-    if (inst.trigger_label) chips.push(`<span class="tag">触发 ${inst.trigger_label}</span>`);
-    $('readbackChips').innerHTML = chips.join('');
+    const notPending = (id) => !$(id).classList.contains('pending');
+    if (inst.rate && notPending('rateSelect')) $('rateSelect').value = inst.rate;
+    if (inst.trigger && notPending('triggerSelect')) $('triggerSelect').value = inst.trigger;
 
     renderFunctionActive();
     renderDevice();
@@ -695,6 +1020,19 @@
     const key = limitKey();
     $('limitModeLabel').textContent = key === 'current' ? '作用量：电流'
       : key === 'voltage' ? '作用量：电压' : '作用量：—';
+    renderDirty();
+  }
+
+  // 未应用的修改：输入框描边 + 按钮呼吸提示
+  function renderDirty() {
+    const sd = !!state.shuntDirty;
+    $('shuntDirtyTag').classList.toggle('hidden', !sd);
+    $('applyShunt').classList.toggle('pending-apply', sd);
+    $('shuntValue').classList.toggle('dirty', sd);
+    const ld = !!state.limitsDirty && !!limitKey();
+    $('limitsDirtyTag').classList.toggle('hidden', !ld);
+    $('applyLimits').classList.toggle('pending-apply', ld);
+    for (const id of ['limitLow', 'limitHigh', 'limitEnabled']) $(id).classList.toggle('dirty', ld);
   }
 
   function updateTitles() {
@@ -745,6 +1083,7 @@
       $('limitHigh').value = '';
       $('limitState').textContent = '不支持';
       $('limitState').className = 'tag';
+      renderDirty();
       return;
     }
     const lim = (state.limits || {})[key] || {};
@@ -753,6 +1092,7 @@
       $('limitLow').value = lim.low === null || lim.low === undefined ? '' : trimNum(lim.low);
       $('limitHigh').value = lim.high === null || lim.high === undefined ? '' : trimNum(lim.high);
     }
+    renderDirty();
     updateLimitTag(state.alarm);
   }
 
@@ -760,15 +1100,31 @@
     const lg = state.logging || {};
     const active = !!lg.active;
     $('logIndicator').classList.toggle('hidden', !active);
-    $('logStart').disabled = active;
-    $('logStop').disabled = !active;
-    $('logStatus').textContent = active
-      ? `记录中 · ${lg.rows || 0} 行`
-      : (lg.file ? `已停止 · ${lg.rows || 0} 行` : '未记录');
-    if (lg.error) $('logStatus').textContent += ' · 写入错误';
+    document.querySelector('.log-card').classList.toggle('recording', active);
+    if (!$('logStart').classList.contains('is-busy')) $('logStart').disabled = active;
+    if (!$('logStop').classList.contains('is-busy')) $('logStop').disabled = !active;
+    const status = $('logStatus');
+    status.textContent = active ? '记录中'
+      : (lg.file ? '已停止' : '未记录');
+    status.className = 'tag' + (active ? ' rec' : '') + (lg.error ? ' alarm' : '');
+    if (lg.error) status.textContent += ' · 写入错误';
+    setText('logRows', String(lg.rows || 0));
     $('logFileInfo').textContent = lg.file
-      ? `${lg.file} · ${lg.rows || 0} 行${active ? ' · 正在写入' : ''}`
+      ? `${active ? '正在写入' : '最近文件'}：${lg.file}`
       : 'CSV 保存到 data/logs/';
+    renderLogClock();
+  }
+
+  function renderLogClock() {
+    const lg = state.logging || {};
+    if (lg.active && lg.started_at) {
+      const el = Date.now() / 1000 - lg.started_at;
+      setText('logElapsed', fmtClock(el));
+      const c = fmtClock(el);
+      setText('logElapsedTop', c.startsWith('00:') ? c.slice(3) : c);
+    } else if (!lg.file) {
+      setText('logElapsed', '00:00:00');
+    }   // 停止后保留最后一次的时长
   }
 
   // ------------------------------------------------------------------
@@ -776,6 +1132,7 @@
   // ------------------------------------------------------------------
   function applyState(d) {
     if (!d) return;
+    if (typeof d.sim === 'boolean') state.sim = d.sim;
     if (d.device) state.device = d.device;
     if (d.instrument && (!state.switching || !d.instrument.function
         || d.instrument.function === state.instrument.function)) {
@@ -783,6 +1140,7 @@
     }
     if (d.config) state.config = d.config;
     if (d.limits) state.limits = d.limits;
+    if (d.null) state.null = d.null;
     if (typeof d.alarm === 'string' && !state.switching) state.alarm = d.alarm;
     if (d.logging) state.logging = d.logging;
     if (d.stats && !state.switching) state.stats = d.stats;
@@ -802,8 +1160,9 @@
     renderLogging();
     renderStats();
     renderReadout();
+    renderNull();
     chart.dirty = true;
-    if (adv.schema && !$('advDrawer').classList.contains('hidden')
+    if (adv.schema && advIsOpen()
         && adv.fn !== state.instrument.function) {
       renderAdvanced();
     }
@@ -839,7 +1198,9 @@
     state.latest = s;
     state.lastSeq = s.seq;
     state.alarm = s.alarm;
+    state.lastSampleAt = Date.now();
     state.readoutDirty = true;
+    state.activityPending = true;
     chart.dirty = true;
   }
 
@@ -923,7 +1284,35 @@
   const chart = { canvas: null, ctx: null, dpr: 1, w: 0, h: 0, dirty: true, cross: null, visible: [] };
 
   function cssVar(name) {
-    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return getComputedStyle(document.body).getPropertyValue(name).trim();
+  }
+
+  // 颜色只在主题/显示模式变化时重新读取，避免每帧 getComputedStyle
+  function chartColors() {
+    const key = state.theme + '|' + state.config.display_mode;
+    if (chart.colors && chart.colorsKey === key) return chart.colors;
+    chart.colorsKey = key;
+    chart.colors = {
+      ink: cssVar('--ink-2'), muted: cssVar('--muted'), grid: cssVar('--grid'),
+      axis: cssVar('--axis'), panel: cssVar('--panel-2'),
+      accent: state.config.display_mode === 'current' ? cssVar('--accent-current') : cssVar('--accent'),
+      bad: cssVar('--bad'), warn: cssVar('--warn'),
+    };
+    return chart.colors;
+  }
+
+  // 交互期间（拖动/缩放/悬停）按显示器刷新率重绘
+  function markInteract(ms = 600) {
+    chart.interactUntil = performance.now() + ms;
+    chart.dirty = true;
+  }
+
+  // 把 #rrggbb 颜色加上透明度
+  function withAlpha(color, a) {
+    const m = /^#([0-9a-f]{6})$/i.exec(color || '');
+    if (!m) return color;
+    const n = parseInt(m[1], 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
   }
 
   function setupChart() {
@@ -960,8 +1349,9 @@
         best = lo - 1;
       }
       const bestD = Math.abs(chart.visible[best].px - x);
-      if (bestD <= 40) { chart.cross = best; chart.dirty = true; }
-      else if (chart.cross !== null) { chart.cross = null; chart.dirty = true; }
+      if (bestD <= 40) {
+        if (chart.cross !== best) { chart.cross = best; markInteract(300); }
+      } else if (chart.cross !== null) { chart.cross = null; markInteract(300); }
     });
     chart.canvas.addEventListener('mouseleave', () => { chart.cross = null; chart.dirty = true; });
     chart.canvas.addEventListener('keydown', (ev) => {
@@ -992,21 +1382,24 @@
       const newSpan = Math.min(3600, Math.max(0.2, span * factor));
       const newTMin = cursorT - ratio * newSpan;
       state.view = { live: false, start: newTMin, end: newTMin + newSpan };
+      chart.momentum = null;
       setZoomUI();
       chart.cross = null;
-      chart.dirty = true;
+      markInteract();
       ensureHistory();
     }, { passive: false });
 
     // 拖动平移
     chart.canvas.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0 || !chart.geom) return;
+      chart.momentum = null;
       drag = {
         x: ev.clientX,
         tMin: chart.geom.tMin,
         tMax: chart.geom.tMax,
         plotW: chart.geom.plotW,
         moved: false,
+        hist: [{ x: ev.clientX, t: performance.now() }],
       };
       chart.cross = null;
       chart.dirty = true;
@@ -1022,12 +1415,29 @@
       const span = drag.tMax - drag.tMin;
       const dt = -(dx / drag.plotW) * span;
       state.view = { live: false, start: drag.tMin + dt, end: drag.tMax + dt };
+      const nowT = performance.now();
+      drag.hist.push({ x: ev.clientX, t: nowT });
+      while (drag.hist.length > 2 && nowT - drag.hist[0].t > 100) drag.hist.shift();
       setZoomUI();
-      chart.dirty = true;
+      markInteract();
       ensureHistory();
     });
     const endDrag = (ev) => {
       if (!drag) return;
+      // 松手惯性：用最后 100ms 的拖动速度继续滑动并减速
+      if (drag.moved && ev.type === 'pointerup' && !REDUCED_MOTION) {
+        const h = drag.hist;
+        const a = h[0], b = h[h.length - 1];
+        const dtMs = b.t - a.t;
+        if (dtMs > 0 && performance.now() - b.t < 80) {
+          const pxPerMs = (b.x - a.x) / dtMs;
+          if (Math.abs(pxPerMs) > 0.15) {
+            const span = drag.tMax - drag.tMin;
+            chart.momentum = { v: -(pxPerMs / drag.plotW) * span, last: performance.now() };
+            markInteract(1500);
+          }
+        }
+      }
       drag = null;
       chart.canvas.style.cursor = '';
       try { chart.canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
@@ -1040,6 +1450,23 @@
     });
   }
 
+  function stepMomentum(now) {
+    const m = chart.momentum;
+    if (!m) return;
+    const dt = Math.min(50, now - m.last);
+    m.last = now;
+    if (state.view.live) { chart.momentum = null; return; }
+    const shift = m.v * dt;
+    state.view = { live: false, start: state.view.start + shift, end: state.view.end + shift };
+    m.v *= Math.pow(0.995, dt);   // 指数衰减
+    const span = state.view.end - state.view.start;
+    if (Math.abs(m.v * 16) < span * 0.0005) {
+      chart.momentum = null;
+      ensureHistory();
+    }
+    markInteract(200);
+  }
+
   function setZoomUI() {
     const live = state.view.live;
     const liveBtn = $('zoomLive');
@@ -1047,13 +1474,16 @@
     for (const b of $('windowGroup').querySelectorAll('button')) {
       b.classList.toggle('active', live && parseInt(b.dataset.window, 10) === state.windowSec);
     }
+    if (liveBtn) liveBtn.classList.toggle('attn', !live);
     const hint = $('zoomHint');
     if (hint) {
-      hint.textContent = live ? '滚轮缩放 · 拖动平移' : '已缩放 · 双击或点「实时」恢复';
+      hint.textContent = live ? '滚轮缩放 · 拖动平移 · 双击复位' : '已暂停跟随 · 双击或按 L 回到实时';
+      hint.classList.toggle('zoomed', !live);
     }
   }
 
   function resetZoomView() {
+    chart.momentum = null;
     state.view = { live: true, start: 0, end: 0 };
     setZoomUI();
     chart.dirty = true;
@@ -1066,9 +1496,10 @@
     const mid = (dom.tMin + dom.tMax) / 2;
     const span = Math.max(0.2, Math.min(3600, (dom.tMax - dom.tMin) * factor));
     state.view = { live: false, start: mid - span / 2, end: mid + span / 2 };
+    chart.momentum = null;
     setZoomUI();
     chart.cross = null;
-    chart.dirty = true;
+    markInteract();
     ensureHistory();
   }
 
@@ -1097,16 +1528,18 @@
     const bucket = Math.ceil(points.length / Math.max(1, maxPoints / 2));
     const out = [];
     for (let i = 0; i < points.length; i += bucket) {
-      const slice = points.slice(i, i + bucket);
+      const end = Math.min(points.length, i + bucket);
       let lo = null, hi = null, hasOl = false;
-      for (const p of slice) {
+      for (let j = i; j < end; j++) {
+        const p = points[j];
         if (p.d === null || p.d === undefined) { hasOl = true; continue; }
         if (!lo || p.d < lo.d) lo = p;
         if (!hi || p.d > hi.d) hi = p;
       }
       // 保留 OL 断点，避免把超量程区间连成假数据
       if (hasOl) {
-        out.push({ t: slice[0].t, d: null, ol: true, u: slice[0].u, fn: slice[0].fn, raw: 'OL' });
+        const f = points[i];
+        out.push({ t: f.t, d: null, ol: true, u: f.u, fn: f.fn, raw: 'OL' });
       }
       if (lo && hi) {
         // 按时间顺序输出，不能固定先 min 后 max，否则会画出假竖线
@@ -1126,12 +1559,7 @@
     const W = chart.w, H = chart.h;
     ctx.clearRect(0, 0, W, H);
 
-    const colors = {
-      ink: cssVar('--ink-2'), muted: cssVar('--muted'), grid: cssVar('--grid'),
-      axis: cssVar('--axis'), panel: cssVar('--panel-2'),
-      accent: state.config.display_mode === 'current' ? cssVar('--accent-current') : cssVar('--accent'),
-      bad: cssVar('--bad'), warn: cssVar('--warn'),
-    };
+    const colors = chartColors();
     const unit = baseUnit();
     const emptyEl = $('chartEmpty');
 
@@ -1149,7 +1577,9 @@
     const endIdx = lowerBound(arr, tMax + 1e-9);
     let pts = arr.slice(startIdx, endIdx);
     if (!pts.length) {
-      emptyEl.textContent = dom.free ? '该时间段没有数据（拖动或缩小查看）' : '等待数据…';
+      emptyEl.textContent = dom.free ? '该时间段没有数据（拖动或缩小查看）'
+        : (isOnline() ? '等待数据…' : '设备未连接');
+      emptyEl.classList.toggle('static', dom.free || !isOnline());
       emptyEl.classList.remove('hidden');
       chart.visible = [];
       return;
@@ -1159,6 +1589,7 @@
     const numeric = pts.filter(p => p.d !== null && p.d !== undefined && Number.isFinite(p.d));
     if (!numeric.length) {
       emptyEl.textContent = '当前超量程（OL），等待有效数据…';
+      emptyEl.classList.add('static');
       emptyEl.classList.remove('hidden');
       chart.visible = [];
       return;
@@ -1266,36 +1697,65 @@
     let gap = 1.0;
     if (pts.length > 2) {
       const diffs = [];
-      for (let i = 1; i < pts.length; i++) diffs.push(pts[i].t - pts[i - 1].t);
+      const stride = Math.max(1, Math.floor((pts.length - 1) / 256));
+      for (let i = 1; i < pts.length; i += stride) diffs.push(pts[i].t - pts[i - 1].t);
       diffs.sort((a, b) => a - b);
       const med = diffs[Math.floor(diffs.length / 2)];
       if (med > 0) gap = Math.max(0.5, med * 4);
     }
-    let prev = null;
-    ctx.strokeStyle = colors.accent;
-    ctx.lineWidth = 2;
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.beginPath();
+    // 按连续段收集坐标（OL / 断档处断开）
+    const segs = [];
+    let cur = null, prev = null;
     for (const p of drawPts) {
       if (p.d === null || p.d === undefined || !Number.isFinite(p.d)) {
-        prev = null;
+        prev = null; cur = null;
         continue;
       }
       const x = xOf(p.t), y = yOf(p.d);
-      if (prev === null || p.t - prev > gap) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      if (prev === null || p.t - prev > gap || !cur) { cur = []; segs.push(cur); }
+      cur.push(x, y);
       prev = p.t;
+    }
+
+    // 面积渐变填充
+    const baseY = marg.t + plotH;
+    const grad = ctx.createLinearGradient(0, marg.t, 0, baseY);
+    grad.addColorStop(0, withAlpha(colors.accent, 0.20));
+    grad.addColorStop(1, withAlpha(colors.accent, 0));
+    ctx.fillStyle = grad;
+    for (const seg of segs) {
+      if (seg.length < 4) continue;
+      ctx.beginPath();
+      ctx.moveTo(seg[0], baseY);
+      for (let i = 0; i < seg.length; i += 2) ctx.lineTo(seg[i], seg[i + 1]);
+      ctx.lineTo(seg[seg.length - 2], baseY);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.strokeStyle = colors.accent;
+    ctx.lineWidth = 1.75;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (const seg of segs) {
+      ctx.moveTo(seg[0], seg[1]);
+      if (seg.length === 2) ctx.lineTo(seg[0] + 0.01, seg[1]);
+      for (let i = 2; i < seg.length; i += 2) ctx.lineTo(seg[i], seg[i + 1]);
     }
     ctx.stroke();
 
     // 最新点
     const last = numeric[numeric.length - 1];
     const lx = xOf(last.t), ly = yOf(last.d);
-    ctx.fillStyle = colors.panel;
-    ctx.beginPath(); ctx.arc(lx, ly, 5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = colors.accent;
-    ctx.beginPath(); ctx.arc(lx, ly, 3.5, 0, Math.PI * 2); ctx.fill();
+    if (lx >= marg.l - 1 && lx <= W - marg.r + 1) {
+      ctx.fillStyle = withAlpha(colors.accent, 0.22);
+      ctx.beginPath(); ctx.arc(lx, ly, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = colors.panel;
+      ctx.beginPath(); ctx.arc(lx, ly, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = colors.accent;
+      ctx.beginPath(); ctx.arc(lx, ly, 3.5, 0, Math.PI * 2); ctx.fill();
+    }
 
     // 十字光标使用降采样后的点，避免高速采样时每帧处理上万点
     chart.visible = drawPts.map(p => ({
@@ -1315,9 +1775,16 @@
         ctx.fillStyle = colors.ink;
         ctx.beginPath(); ctx.arc(cp.px, cp.py, 3, 0, Math.PI * 2); ctx.fill();
       }
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = colors.axis;
+      if (cp.py !== null) {
+        ctx.beginPath(); ctx.moveTo(marg.l, cp.py + 0.5); ctx.lineTo(W - marg.r, cp.py + 0.5); ctx.stroke();
+      }
+      ctx.setLineDash([]);
       const v = cp.s.d;
-      const txt = v === null || v === undefined ? 'OL' : (fmtEng(v, unit, 6).text + ' ' + fmtEng(v, unit, 6).unit);
-      tip.innerHTML = `<div>${timeStr(cp.s.t)}</div><div>${txt}</div>`;
+      let txt = 'OL';
+      if (v !== null && v !== undefined) { const f = fmtEng(v, unit, 6); txt = f.text + ' ' + f.unit; }
+      tip.innerHTML = `<div class="tip-v">${txt}</div><div class="tip-t">${timeStr(cp.s.t)}</div>`;
       tip.classList.remove('hidden');
       const tw = tip.offsetWidth, th = tip.offsetHeight;
       let left = cp.px + 12, top = (cp.py !== null ? cp.py : marg.t) - th - 10;
@@ -1332,12 +1799,21 @@
 
   function chartTick() {
     const now = performance.now();
+    if (state.activityPending && now - (chart.lastBlink || 0) >= 140 && !document.hidden) {
+      state.activityPending = false;
+      chart.lastBlink = now;
+      const led = $('activityLed');
+      led.classList.add('blink');
+      setTimeout(() => led.classList.remove('blink'), 70);
+    }
     if (state.readoutDirty && !document.hidden && now - (chart.lastReadout || 0) >= 200) {
       chart.lastReadout = now;
       state.readoutDirty = false;
       renderReadout();
     }
-    if (chart.dirty && !document.hidden && now - (chart.lastDraw || 0) >= 200) {
+    stepMomentum(now);
+    const interval = now < (chart.interactUntil || 0) ? 0 : 200;
+    if (chart.dirty && !document.hidden && now - (chart.lastDraw || 0) >= interval) {
       chart.lastDraw = now;
       try { drawChart(); } catch (err) { console.error(err); }
       chart.dirty = false;
@@ -1351,19 +1827,34 @@
   function renderTable() {
     if (!state.tableOpen) return;
     const unit = baseUnit();
-    const rows = state.samples.slice(-100).reverse().map(s => {
+    const wrap = $('tableWrap');
+    // 用户向下翻看时不刷新，避免内容跳动
+    if (wrap.scrollTop > 4) return;
+    const rows = state.samples.slice(-200).reverse().map(s => {
       const v = s.ol || s.d === null ? 'OL' : (() => { const x = fmtEng(s.d, s.u || unit, 6); return x.text + ' ' + x.unit; })();
       const st = s.alarm === 'low' ? '低于下限' : s.alarm === 'high' ? '高于上限' : s.alarm === 'ol' ? '超量程' : '正常';
-      return `<tr><td>${timeStr(s.t)}</td><td>${v}</td><td>${st}</td></tr>`;
+      const cls = s.alarm === 'low' || s.alarm === 'ol' ? 'st-bad' : s.alarm === 'high' ? 'st-warn' : '';
+      return `<tr><td>${timeStr(s.t)}</td><td>${v}</td><td class="${cls}">${st}</td></tr>`;
     });
-    $('sampleTable').innerHTML = rows.join('');
+    $('sampleTable').innerHTML = rows.length ? rows.join('')
+      : '<tr><td colspan="3" style="color:var(--muted)">暂无数据</td></tr>';
   }
   setInterval(renderTable, 500);
-  $('tableToggle').addEventListener('click', () => {
-    state.tableOpen = !state.tableOpen;
+
+  function setView(view) {
+    state.tableOpen = view === 'table';
     $('tableWrap').classList.toggle('hidden', !state.tableOpen);
-    $('tableToggle').textContent = state.tableOpen ? '图表' : '表格';
+    $('chartWrap').classList.toggle('hidden', state.tableOpen);
+    for (const b of $('viewGroup').querySelectorAll('button')) {
+      b.classList.toggle('active', b.dataset.view === view);
+    }
     if (state.tableOpen) renderTable();
+    else chart.dirty = true;
+    try { localStorage.setItem('dmm-view', view); } catch (_) {}
+  }
+  $('viewGroup').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button');
+    if (btn) setView(btn.dataset.view);
   });
 
   // ------------------------------------------------------------------
@@ -1371,22 +1862,30 @@
   // ------------------------------------------------------------------
   async function applySelect(el, action, label) {
     const requested = el.value;
+    const text = el.options[el.selectedIndex] ? el.options[el.selectedIndex].textContent : requested;
     el.disabled = true;
+    el.classList.add('pending');
+    let ok = false;
     try {
       const result = await postJSON('/api/control', { action, value: requested });
       const applied = result.applied && result.applied[action];
+      el.classList.remove('pending');
       if (applied && applied !== requested) {
         showToast(`仪器未接受该${label}，当前为 ${applied}`, 'error');
         renderControls();
       } else {
-        showToast(label + '已切换', 'ok');
+        ok = true;
+        showToast(`${label}：${text}`, 'ok');
       }
     } catch (err) {
+      el.classList.remove('pending');
       showToast(err.message, 'error');
       renderControls();
     } finally {
+      el.classList.remove('pending');
       el.disabled = false;
       renderDevice();
+      if (ok) flashOk(el);
     }
   }
 
@@ -1395,8 +1894,15 @@
   $('triggerSelect').addEventListener('change', () => applySelect($('triggerSelect'), 'trigger', '触发源'));
 
   $('syncState').addEventListener('click', async () => {
-    try { await postJSON('/api/control', { action: 'sync' }); showToast('状态已刷新', 'ok'); }
-    catch (err) { showToast(err.message, 'error'); }
+    const btn = $('syncState');
+    if (btn.classList.contains('spinning')) return;
+    btn.classList.add('spinning');
+    try {
+      await postJSON('/api/control', { action: 'sync' });
+      showToast('已从仪器回读状态', 'ok');
+      loadIntegrationTime();
+    } catch (err) { showToast(err.message, 'error'); }
+    finally { btn.classList.remove('spinning'); }
   });
 
   $('modeGroup').addEventListener('click', async (ev) => {
@@ -1405,62 +1911,110 @@
     const mode = btn.dataset.mode;
     if (mode === state.config.display_mode) return;
     const r = (parseFloat($('shuntValue').value) || 0) * parseFloat($('shuntUnit').value);
-    if (!(r > 0)) { showToast('请先填写有效的分流电阻', 'error'); return; }
+    if (!(r > 0)) { markInvalid($('shuntValue'), '请先填写有效的分流电阻'); return; }
+    if (mode === 'current' && state.instrument.function && state.instrument.function !== 'DCV') {
+      const ok = await confirmDialog(
+        `分流电流模式需要使用 DCV 档。\n当前功能「${funcLabel(state.instrument.function)}」将被切换为直流电压。`,
+        { title: '切换到分流电流模式', ok: '切换' });
+      if (!ok) return;
+    }
+    const group = $('modeGroup');
+    group.style.pointerEvents = 'none';
     try {
       await postJSON('/api/config', { display_mode: mode, shunt_ohm: r });
       state.shuntDirty = false;
       state.limitsMode = null;
       renderLimits(true);
-      showToast(mode === 'current' ? '已切换到分流电流模式' : '已切换到直接电压模式', 'ok');
+      renderDirty();
+      showToast(mode === 'current' ? '已切换到分流电流模式 · ' + fmtR(r) : '已切换到直接电压模式', 'ok');
     } catch (err) { showToast(err.message, 'error'); }
+    finally { group.style.pointerEvents = ''; }
   });
 
-  $('shuntValue').addEventListener('input', () => { state.shuntDirty = true; });
-  $('shuntUnit').addEventListener('change', () => { state.shuntDirty = true; });
+  $('shuntValue').addEventListener('input', () => { state.shuntDirty = true; renderDirty(); });
+  $('shuntUnit').addEventListener('change', () => { state.shuntDirty = true; renderDirty(); });
+  onEnter($('shuntValue'), () => $('applyShunt').click());
 
-  $('applyShunt').addEventListener('click', async () => {
+  $('applyShunt').addEventListener('click', () => {
     const r = (parseFloat($('shuntValue').value) || 0) * parseFloat($('shuntUnit').value);
-    if (!(r > 0)) { showToast('分流电阻必须大于 0', 'error'); return; }
-    try {
-      await postJSON('/api/config', { display_mode: state.config.display_mode, shunt_ohm: r });
-      state.shuntDirty = false;
-      showToast('分流设置已应用', 'ok');
-    } catch (err) { showToast(err.message, 'error'); }
+    if (!(r > 0)) { markInvalid($('shuntValue'), '分流电阻必须大于 0'); return; }
+    return withBusy($('applyShunt'), async () => {
+      try {
+        await postJSON('/api/config', { display_mode: state.config.display_mode, shunt_ohm: r });
+        state.shuntDirty = false;
+        renderDirty();
+        flashOk($('shuntValue'));
+        showToast('分流设置已应用 · ' + fmtR(r), 'ok');
+      } catch (err) { showToast(err.message, 'error'); }
+    });
   });
 
+  const markLimitsDirty = () => { state.limitsDirty = true; renderDirty(); };
   for (const id of ['limitLow', 'limitHigh']) {
-    $(id).addEventListener('input', () => { state.limitsDirty = true; });
+    $(id).addEventListener('input', markLimitsDirty);
+    onEnter($(id), () => $('applyLimits').click());
   }
-  $('limitLowUnit').addEventListener('change', () => { state.limitsDirty = true; });
-  $('limitHighUnit').addEventListener('change', () => { state.limitsDirty = true; });
+  $('limitLowUnit').addEventListener('change', markLimitsDirty);
+  $('limitHighUnit').addEventListener('change', markLimitsDirty);
+  $('limitEnabled').addEventListener('change', markLimitsDirty);
 
-  $('applyLimits').addEventListener('click', async () => {
+  $('applyLimits').addEventListener('click', () => {
     const mode = limitKey();
     if (!mode) { showToast('当前功能不支持限值报警', 'error'); return; }
     const lowRaw = $('limitLow').value;
     const highRaw = $('limitHigh').value;
     const low = lowRaw === '' ? null : parseFloat(lowRaw) * parseFloat($('limitLowUnit').value);
     const high = highRaw === '' ? null : parseFloat(highRaw) * parseFloat($('limitHighUnit').value);
-    try {
-      await postJSON('/api/limits', {
-        mode, enabled: $('limitEnabled').checked, low, high,
-      });
-      state.limitsDirty = false;
-      showToast('限值已应用', 'ok');
-    } catch (err) { showToast(err.message, 'error'); }
+    if (lowRaw !== '' && !Number.isFinite(low)) { markInvalid($('limitLow'), '下限不是有效数字'); return; }
+    if (highRaw !== '' && !Number.isFinite(high)) { markInvalid($('limitHigh'), '上限不是有效数字'); return; }
+    if ($('limitEnabled').checked && (low === null || high === null)) {
+      markInvalid(low === null ? $('limitLow') : $('limitHigh'), '启用报警时请同时填写上下限');
+      return;
+    }
+    if (low !== null && high !== null && low >= high) {
+      markInvalid($('limitHigh'), '下限必须小于上限');
+      return;
+    }
+    return withBusy($('applyLimits'), async () => {
+      try {
+        await postJSON('/api/limits', {
+          mode, enabled: $('limitEnabled').checked, low, high,
+        });
+        state.limitsDirty = false;
+        renderDirty();
+        flashOk($('limitLow'), $('limitHigh'));
+        showToast($('limitEnabled').checked ? '限值已应用' : '限值已保存（报警未启用）', 'ok');
+      } catch (err) { showToast(err.message, 'error'); }
+    });
   });
 
-  $('statsReset').addEventListener('click', async () => {
-    try { await postJSON('/api/stats/reset', {}); showToast('统计已重置', 'ok'); }
-    catch (err) { showToast(err.message, 'error'); }
-  });
+  function resetStats() {
+    return withBusy($('statsReset'), async () => {
+      try { await postJSON('/api/stats/reset', {}); showToast('统计已重置', 'ok'); }
+      catch (err) { showToast(err.message, 'error'); }
+    });
+  }
+  $('statsReset').addEventListener('click', resetStats);
 
-  $('statsConfigBtn').addEventListener('click', () => {
+  function setStatsConfigOpen(open) {
     const panel = $('statsConfig');
-    panel.classList.toggle('hidden');
-    if (!panel.classList.contains('hidden')) renderStatsConfig();
+    panel.classList.toggle('hidden', !open);
+    $('statsConfigBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+    $('statsConfigBtn').classList.toggle('active', open);
+    if (open) renderStatsConfig();
+  }
+  $('statsConfigBtn').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    setStatsConfigOpen($('statsConfig').classList.contains('hidden'));
   });
-  $('statsConfigClose').addEventListener('click', () => $('statsConfig').classList.add('hidden'));
+  $('statsConfigClose').addEventListener('click', () => setStatsConfigOpen(false));
+  // 点击弹层外部关闭
+  document.addEventListener('pointerdown', (ev) => {
+    const panel = $('statsConfig');
+    if (panel.classList.contains('hidden')) return;
+    if (panel.contains(ev.target) || $('statsConfigBtn').contains(ev.target)) return;
+    setStatsConfigOpen(false);
+  });
   $('statsConfigDefault').addEventListener('click', () => {
     state.statMetrics = [...DEFAULT_STAT_METRICS];
     saveStatMetrics();
@@ -1474,36 +2028,61 @@
     renderStats();
   });
 
-  $('logStart').addEventListener('click', async () => {
-    try { const d = await postJSON('/api/log/start', {}); state.logging = d.logging; renderLogging(); fetchLogs(); }
-    catch (err) { showToast(err.message, 'error'); }
-  });
-  $('logStop').addEventListener('click', async () => {
-    try { const d = await postJSON('/api/log/stop', {}); state.logging = d.logging; renderLogging(); fetchLogs(); }
-    catch (err) { showToast(err.message, 'error'); }
-  });
-  $('refreshLogs').addEventListener('click', fetchLogs);
+  $('logStart').addEventListener('click', () => withBusy($('logStart'), async () => {
+    try {
+      const d = await postJSON('/api/log/start', {});
+      state.logging = d.logging; renderLogging(); fetchLogs();
+      showToast('开始记录 · ' + (d.logging && d.logging.file ? d.logging.file : 'CSV'), 'ok');
+    } catch (err) { showToast(err.message, 'error'); }
+  }));
+  $('logStop').addEventListener('click', () => withBusy($('logStop'), async () => {
+    try {
+      const d = await postJSON('/api/log/stop', {});
+      const lg = d.logging || {};
+      state.logging = lg; renderLogging(); fetchLogs();
+      showToast(`记录已停止 · 共 ${lg.rows || 0} 行`, 'ok');
+    } catch (err) { showToast(err.message, 'error'); }
+  }));
+  $('refreshLogs').addEventListener('click', () => withBusy($('refreshLogs'), () => fetchLogs(true)));
 
-  async function fetchLogs() {
+  function fmtSize(n) {
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+    return n + ' B';
+  }
+
+  async function fetchLogs(manual = false) {
     try {
       const d = await api('/api/logs');
       state.logging = d.logging || state.logging;
       renderLogging();
       const list = $('logList');
+      const prevKnown = state.knownLogs;
+      state.knownLogs = new Set(d.files.map(f => f.name));
       list.innerHTML = '';
       if (!d.files.length) {
-        list.innerHTML = '<div class="log-item"><span class="name">暂无记录文件</span></div>';
+        list.innerHTML = '<div class="log-empty">暂无记录文件 · 点击「开始记录」保存 CSV</div>';
         return;
       }
       for (const f of d.files) {
         const div = document.createElement('div');
-        div.className = 'log-item' + (f.active ? ' active' : '');
-        const k = f.size > 1024 ? (f.size / 1024).toFixed(1) + ' KB' : f.size + ' B';
-        div.innerHTML = `<span class="name">${f.name}</span>
-          <span class="meta">${k}</span>
-          <a href="/api/logs/${encodeURIComponent(f.name)}/download">下载</a>`;
+        const isNew = prevKnown && !prevKnown.has(f.name);
+        div.className = 'log-item' + (f.active ? ' active' : '') + (isNew ? ' new' : '');
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = f.name;
+        name.title = f.name;
+        const meta = document.createElement('span');
+        meta.className = 'meta';
+        meta.textContent = fmtSize(f.size) + (f.mtime ? ' · ' + fmtAgo(f.mtime) : '');
+        const a = document.createElement('a');
+        a.href = `/api/logs/${encodeURIComponent(f.name)}/download`;
+        a.textContent = '下载';
+        a.setAttribute('download', f.name);
+        div.append(name, meta, a);
         list.appendChild(div);
       }
+      if (manual) showToast(`共 ${d.files.length} 个记录文件`);
     } catch (err) { showToast(err.message, 'error'); }
   }
 
@@ -1512,6 +2091,8 @@
     const btn = ev.target.closest('button');
     if (!btn) return;
     state.windowSec = parseInt(btn.dataset.window, 10);
+    try { localStorage.setItem('dmm-window', String(state.windowSec)); } catch (_) {}
+    if (state.tableOpen) setView('chart');
     state.view = { live: true, start: 0, end: 0 };
     setZoomUI();
     chart.dirty = true;
@@ -1527,18 +2108,63 @@
   // ------------------------------------------------------------------
   const adv = { schema: null, fn: null };
 
+  function advIsOpen() {
+    const d = $('advDrawer');
+    return !d.classList.contains('hidden') && !d.classList.contains('closing');
+  }
+
   function advOpen() {
-    $('advBackdrop').classList.remove('hidden');
-    $('advDrawer').classList.remove('hidden');
-    $('advDrawer').setAttribute('aria-hidden', 'false');
+    const d = $('advDrawer'), b = $('advBackdrop');
+    clearTimeout(adv.closeTimer);
+    d.classList.remove('closing'); b.classList.remove('closing');
+    b.classList.remove('hidden');
+    d.classList.remove('hidden');
+    d.setAttribute('aria-hidden', 'false');
+    adv.prevFocus = document.activeElement;
+    setTimeout(() => $('advClose').focus(), 30);
     loadAdvanced();
   }
 
   function advClose() {
-    $('advBackdrop').classList.add('hidden');
-    $('advDrawer').classList.add('hidden');
-    $('advDrawer').setAttribute('aria-hidden', 'true');
+    const d = $('advDrawer'), b = $('advBackdrop');
+    if (d.classList.contains('hidden')) return;
+    d.setAttribute('aria-hidden', 'true');
+    const finish = () => {
+      d.classList.add('hidden'); b.classList.add('hidden');
+      d.classList.remove('closing'); b.classList.remove('closing');
+    };
+    if (REDUCED_MOTION) { finish(); }
+    else {
+      d.classList.add('closing'); b.classList.add('closing');
+      adv.closeTimer = setTimeout(finish, 200);
+    }
+    if (adv.prevFocus && adv.prevFocus.focus) adv.prevFocus.focus();
   }
+
+  function filterAdvanced() {
+    const q = ($('advSearch').value || '').trim().toLowerCase();
+    for (const g of $('advBody').querySelectorAll('.adv-group')) {
+      let shown = 0;
+      for (const it of g.querySelectorAll('.adv-item')) {
+        const hit = !q || (it.dataset.search || '').includes(q);
+        it.classList.toggle('hidden', !hit);
+        if (hit) shown++;
+      }
+      const title = (g.querySelector('.adv-group-title') || {}).textContent || '';
+      const groupHit = q && title.toLowerCase().includes(q);
+      if (groupHit) for (const it of g.querySelectorAll('.adv-item')) it.classList.remove('hidden');
+      g.classList.toggle('hidden', !!q && !shown && !groupHit);
+      if (q && (shown || groupHit) && !g.open) g.open = true;
+    }
+  }
+  $('advSearch').addEventListener('input', filterAdvanced);
+  $('advSearch').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $('advSearch').value) {
+      e.stopPropagation();
+      $('advSearch').value = '';
+      filterAdvanced();
+    }
+  });
 
   async function loadAdvanced() {
     if (!adv.schema) {
@@ -1581,7 +2207,8 @@
       details.className = 'adv-group';
       details.dataset.group = group.key;
       const summary = document.createElement('summary');
-      summary.innerHTML = `<span class="adv-group-title">${group.label}</span>`;
+      summary.innerHTML = `<span class="adv-group-title">${group.label}</span>`
+        + `<span class="adv-group-count">${items.length} 项</span>`;
       details.appendChild(summary);
 
       const wrap = document.createElement('div');
@@ -1602,12 +2229,15 @@
       first.open = true;
       loadAdvGroup(first);
     }
+    filterAdvanced();
   }
 
   function renderAdvItem(item) {
     const div = document.createElement('div');
     div.className = 'adv-item';
     div.dataset.key = item.key;
+    div.dataset.search = [item.label, item.key, item.hint || '', item.command || '']
+      .join(' ').toLowerCase();
 
     const label = document.createElement('span');
     label.className = 'adv-label';
@@ -1669,7 +2299,11 @@
       const btn = document.createElement('button');
       btn.className = 'btn btn-ghost btn-sm';
       btn.textContent = '应用';
-      btn.addEventListener('click', () => setAdvValue(item, input.value, readback));
+      btn.addEventListener('click', () => {
+        if (input.value === '') { markInvalid(input, '请输入数值'); return; }
+        withBusy(btn, () => setAdvValue(item, input.value, readback));
+      });
+      onEnter(input, () => btn.click());
       row.appendChild(btn);
       if (item.action) {
         const act = document.createElement('button');
@@ -1725,8 +2359,13 @@
           el.className = 'adv-readback err';
           continue;
         }
-        el.textContent = res.value;
-        el.className = 'adv-readback ok';
+        if (el.textContent !== String(res.value)) {
+          el.textContent = res.value;
+          el.className = 'adv-readback ok';
+          restartClass(el, 'flash');
+        } else {
+          el.className = 'adv-readback ok';
+        }
         if (item.kind === 'select') {
           const sel = document.querySelector(`select[data-adv-select="${key}"]`);
           const matched = (item.options || []).find(([code]) =>
@@ -1762,9 +2401,15 @@
       if (readback) {
         readback.textContent = d.value || '已应用';
         readback.className = 'adv-readback ok';
+        restartClass(readback, 'flash');
       }
+      const inp = $('adv-input-' + item.key);
+      if (inp) delete inp.dataset.userEdited;
       showToast(item.label + ' 已设置', 'ok');
-      if (item.key === 'itp' || item.key === 'its') loadIntegrationTime();
+      if (item.key === 'itp' || item.key === 'its' || item.key === 'digits') {
+        loadIntegrationTime();
+      }
+      if (item.key === 'digits') renderReadout();
     } catch (err) {
       showToast(err.message, 'error');
       if (readback) {
@@ -1779,10 +2424,10 @@
       showToast('设备未连接，无法下发设置', 'error');
       return;
     }
-    if (item.confirm && !window.confirm(item.confirm)) return;
+    if (item.confirm && !(await confirmDialog(item.confirm, { title: item.label }))) return;
     const old = btn.textContent;
     btn.disabled = true;
-    btn.textContent = '执行中…';
+    btn.classList.add('is-busy');
     try {
       const d = await postJSON('/api/advanced/action', { key: item.key });
       const el = $('adv-val-' + item.key);
@@ -1800,6 +2445,7 @@
       showToast(err.message, 'error');
     } finally {
       btn.disabled = false;
+      btn.classList.remove('is-busy');
       btn.textContent = old;
     }
   }
@@ -1813,11 +2459,93 @@
       showToast('请先展开要刷新的分组');
       return;
     }
-    await Promise.all(open.map(g => loadAdvGroup(g)));
+    await withBusy($('advRefresh'), () => Promise.all(open.map(g => loadAdvGroup(g))));
     showToast('高级设置已刷新', 'ok');
   });
+
+  // ------------------------------------------------------------------
+  // HOLD / 复制 / 快捷键
+  // ------------------------------------------------------------------
+  function setHold(on, silent = false) {
+    if (on && !state.latest) {
+      if (!silent) showToast('暂无读数可保持', 'error');
+      return;
+    }
+    state.hold = on ? state.latest : null;
+    const btn = $('holdToggle');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.querySelector('span').textContent = on ? '释放 HOLD' : '保持 HOLD';
+    renderReadout();
+    if (!silent) showToast(on ? '读数已保持（采集与记录照常进行）' : '已释放保持');
+  }
+  $('holdToggle').addEventListener('click', () => setHold(!state.hold));
+
+  async function copyReading() {
+    const s = state.hold || state.latest;
+    const txt = readoutText(s);
+    if (!txt) { showToast('暂无读数可复制', 'error'); return; }
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(txt);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = txt;
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      }
+      restartClass($('valueCopy'), 'copied');
+      showToast('已复制 ' + txt, 'ok');
+    } catch (_) {
+      showToast('复制失败，请手动选择', 'error');
+    }
+  }
+  $('valueCopy').addEventListener('click', copyReading);
+  $('copyValue').addEventListener('click', copyReading);
+
+  function setLayer(id, open) {
+    $(id).classList.toggle('hidden', !open);
+    if (open) {
+      const btn = $(id).querySelector('.btn-primary, .btn');
+      if (btn) setTimeout(() => btn.focus(), 30);
+    }
+  }
+  $('helpOpen').addEventListener('click', () => setLayer('helpLayer', true));
+  $('helpClose').addEventListener('click', () => setLayer('helpLayer', false));
+  $('helpLayer').addEventListener('click', (e) => { if (e.target === $('helpLayer')) setLayer('helpLayer', false); });
+
+  function isTyping(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || el.isContentEditable;
+  }
+
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('advDrawer').classList.contains('hidden')) advClose();
+    if (e.key === 'Escape') {
+      if (!$('helpLayer').classList.contains('hidden')) { setLayer('helpLayer', false); return; }
+      if (!$('statsConfig').classList.contains('hidden')) { setStatsConfigOpen(false); return; }
+      if (advIsOpen()) { advClose(); return; }
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return;
+    if (!$('confirmLayer').classList.contains('hidden')) return;
+    const k = e.key;
+    if (k === '?' ) { setLayer('helpLayer', $('helpLayer').classList.contains('hidden')); e.preventDefault(); return; }
+    if (advIsOpen() || !$('helpLayer').classList.contains('hidden')) return;
+    switch (k.toLowerCase()) {
+      case 'h': setHold(!state.hold); break;
+      case 'c': copyReading(); break;
+      case 'l': setView('chart'); resetZoomView(); break;
+      case 't': setView(state.tableOpen ? 'chart' : 'table'); break;
+      case 'r': resetStats(); break;
+      case 'a': advOpen(); break;
+      case '+': case '=': zoomBy(1 / 1.6); break;
+      case '-': case '_': zoomBy(1.6); break;
+      default: return;
+    }
+    e.preventDefault();
   });
 
   // ------------------------------------------------------------------
@@ -1826,8 +2554,17 @@
   async function init() {
     applyTheme(state.theme);
     state.statMetrics = loadStatMetrics();
+    try {
+      const w = parseInt(localStorage.getItem('dmm-window'), 10);
+      if ([10, 30, 60, 300, 0].includes(w)) state.windowSec = w;
+    } catch (_) {}
     setupChart();
     setZoomUI();
+    try { if (localStorage.getItem('dmm-view') === 'table') setView('table'); } catch (_) {}
+    setInterval(() => {
+      renderLogClock();
+      if (!document.hidden) renderReadout();   // 刷新停滞提示/时间
+    }, 1000);
     renderStatsConfig();
     renderStats();
     requestAnimationFrame(chartTick);
@@ -1841,10 +2578,8 @@
 
     try {
       const st = await api('/api/state');
+      state.sim = !!st.sim;
       applyState(st);
-      if (st.device && st.device.idn) {
-        $('serverInfo').textContent = `设备 ${st.device.serial || ''} · 真机`;
-      }
     } catch (_) { /* SSE 快照会补上 */ }
 
     connectStream();

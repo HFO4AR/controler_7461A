@@ -81,6 +81,23 @@ class AppTests(unittest.TestCase):
         lim = self.json(r)["limits"]["voltage"]
         self.assertTrue(lim["enabled"])
 
+    def test_null_control_state(self):
+        st = self.json(self.client.get("/api/state"))
+        self.assertIn("null", st)
+        r = self.client.post("/api/advanced/action", json={"key": "null_const"})
+        self.assertEqual(r.status_code, 200)
+        time.sleep(0.3)
+        st = self.json(self.client.get("/api/state"))
+        self.assertTrue(st["null"]["enabled"])
+        self.assertIsNotNone(st["null"]["const"])
+
+        r = self.client.post("/api/advanced/set",
+                             json={"key": "null", "value": "NL0"})
+        self.assertEqual(r.status_code, 200)
+        time.sleep(0.2)
+        st = self.json(self.client.get("/api/state"))
+        self.assertFalse(st["null"]["enabled"])
+
     def test_arbitrary_integration_time(self):
         r = self.client.post("/api/advanced/set", json={"key": "itp", "value": 2.5})
         self.assertEqual(r.status_code, 200)
@@ -217,6 +234,110 @@ class AppTests(unittest.TestCase):
 
         self.client.post("/api/control", json={"action": "function", "value": "DCV"})
         self.client.post("/api/config", json={"display_mode": "voltage", "shunt_ohm": 0.1})
+
+    # -- Agent 接口 ----------------------------------------------------------
+    def test_agent_manifest_and_status(self):
+        data = self.json(self.client.get("/api/agent"))
+        self.assertIn("endpoints", data)
+        self.assertIn("DCV", {f["code"] for f in data["options"]["functions"]})
+        st = self.json(self.client.get("/api/agent/status"))
+        self.assertTrue(st["ok"])
+        self.assertEqual(st["device"]["state"], "online")
+        self.assertIn("latest", st)
+
+    def test_agent_reading(self):
+        r = self.json(self.client.get("/api/agent/reading?fresh=1&timeout=3"))
+        self.assertTrue(r["ok"])
+        self.assertIn("value", r["reading"])
+        self.assertLess(r["reading"]["age_s"], 3)
+        bad = self.client.get("/api/agent/reading?timeout=abc")
+        self.assertEqual(bad.status_code, 400)
+
+    def test_agent_measure(self):
+        r = self.client.post("/api/agent/measure", json={"count": 5, "include_samples": True})
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertTrue(d["complete"])
+        self.assertEqual(len(d["samples"]), 5)
+        self.assertEqual(d["summary"]["n"] + d["summary"]["n_ol"], 5)
+        if d["summary"]["n"]:
+            self.assertLessEqual(d["summary"]["min"], d["summary"]["mean"])
+        r = self.client.post("/api/agent/measure", json={"seconds": 0.3})
+        self.assertEqual(r.status_code, 200)
+        self.assertGreaterEqual(r.get_json()["summary"]["n"], 1)
+        for body in ({"count": 0}, {"count": 1.5}, {"seconds": -1}, {"settle": "x"}):
+            self.assertEqual(self.client.post("/api/agent/measure", json=body).status_code, 400)
+
+    def test_agent_setup(self):
+        r = self.client.post("/api/agent/setup",
+                             json={"function": "RES2W", "rate": "PR3", "settle": 0.2})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        self.assertEqual(d["instrument"]["function"], "RES2W")
+        self.assertEqual(d["instrument"]["rate"], "PR3")
+        self.assertEqual(set(d["applied"]), {"function", "rate"})
+        self.assertIsNotNone(d["reading"])
+        # 分流模式与非 DCV 冲突
+        r = self.client.post("/api/agent/setup", json={"display_mode": "current", "function": "ACV"})
+        self.assertEqual(r.status_code, 409)
+        r = self.client.post("/api/agent/setup", json={"display_mode": "current", "shunt_ohm": 0.5})
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertEqual(d["instrument"]["function"], "DCV")
+        self.assertEqual(d["config"], {"display_mode": "current", "shunt_ohm": 0.5})
+        # 参数校验
+        self.assertEqual(self.client.post("/api/agent/setup", json={"foo": 1}).status_code, 400)
+        r = self.client.post("/api/agent/setup",
+                             json={"display_mode": "voltage", "shunt_ohm": 0.1, "function": "DCV"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.client.post("/api/agent/setup", json={"function": "XYZ"}).status_code, 400)
+
+    def test_mcp_server_tools(self):
+        import json as _json
+        import mcp_server
+
+        def fake_http(method, path, body=None, query=None, timeout=30.0, raw=False):
+            if query:
+                from urllib.parse import urlencode
+                path += "?" + urlencode({k: v for k, v in query.items() if v is not None})
+            resp = (self.client.get(path) if method == "GET"
+                    else self.client.post(path, json=body))
+            if raw:
+                return resp.get_data(as_text=True)
+            data = resp.get_json()
+            if resp.status_code >= 400:
+                raise mcp_server.ApiError(data.get("error"))
+            return data
+
+        orig = mcp_server.http
+        mcp_server.http = fake_http
+        try:
+            init = mcp_server.handle({"method": "initialize",
+                                      "params": {"protocolVersion": "2025-06-18"}})
+            self.assertEqual(init["protocolVersion"], "2025-06-18")
+            names = {t["name"] for t in mcp_server.handle({"method": "tools/list"})["tools"]}
+            self.assertTrue({"dmm_status", "dmm_measure", "dmm_setup"} <= names)
+
+            def call(name, **args):
+                return mcp_server.handle({"method": "tools/call",
+                                          "params": {"name": name, "arguments": args}})
+
+            res = call("dmm_setup", function="DCV", range="AUTO")
+            self.assertFalse(res.get("isError"), res)
+            res = call("dmm_measure", count=3)
+            self.assertFalse(res.get("isError"), res)
+            self.assertEqual(_json.loads(res["content"][0]["text"])["summary"]["n"]
+                             + res["structuredContent"]["summary"]["n_ol"], 3)
+            res = call("dmm_history", seconds=5, max_points=10)
+            self.assertLessEqual(res["structuredContent"]["returned"], 10)
+            res = call("dmm_setup", function="NOPE")
+            self.assertTrue(res["isError"])
+            res = call("dmm_options", include_advanced=True)
+            self.assertIn("advanced", res["structuredContent"])
+            with self.assertRaises(LookupError):
+                call("no_such_tool")
+        finally:
+            mcp_server.http = orig
 
 
 if __name__ == "__main__":

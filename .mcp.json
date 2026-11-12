@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "dmm7461a": {
+      "command": "python3",
+      "args": ["mcp_server.py"],
+      "env": { "DMM_URL": "http://127.0.0.1:7461" }
+    }
+  }
+}

@@ -4,13 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ADCMT 7461A 上位机</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='2' width='26' height='28' rx='5' fill='%23141413' stroke='%233987e5' stroke-width='2'/%3E%3Crect x='7' y='6' width='18' height='9' rx='2' fill='%233987e5'/%3E%3Ccircle cx='11' cy='22' r='2.4' fill='%23d95926'/%3E%3Ccircle cx='21' cy='22' r='2.4' fill='%23c3c2b7'/%3E%3C/svg%3E">
 <script>
   try {
     var t = localStorage.getItem('dmm-theme');
     if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   } catch (e) {}
 </script>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
 </head>
 <body>
 
@@ -20,14 +21,20 @@
     <span class="brand-text">数字万用表上位机</span>
   </div>
   <div class="topbar-right">
-    <div class="conn">
+    <div class="conn" id="connPill" title="连接状态">
       <span id="statusLed" class="led offline"></span>
       <span id="statusText">正在连接…</span>
     </div>
-    <div id="logIndicator" class="log-indicator hidden">
-      <span class="rec-dot"></span>记录中
+    <div id="logIndicator" class="log-indicator hidden" title="正在记录 CSV">
+      <span class="rec-dot"></span><span>REC</span><span id="logElapsedTop" class="rec-time">00:00</span>
     </div>
-    <button id="advOpen" class="btn btn-ghost btn-sm">高级设置</button>
+    <button id="advOpen" class="btn btn-ghost btn-sm" title="高级设置 (A)">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+      高级设置
+    </button>
+    <button id="helpOpen" class="icon-btn" title="快捷键 (?)" aria-label="快捷键说明">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
+    </button>
     <button id="themeToggle" class="icon-btn" title="切换深色/浅色主题" aria-label="切换主题">
       <svg id="iconMoon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
       <svg id="iconSun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="hidden"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -40,33 +47,63 @@
 
     <div class="main-top">
       <!-- 读数页 -->
-      <section class="card readout-card">
+      <section class="card readout-card" id="readoutCard">
         <div class="page-head">
           <div class="page-title-wrap">
             <span class="page-kicker">测量功能页</span>
             <h1 id="pageTitle">直流电压</h1>
           </div>
-          <span id="pageCode" class="code-pill">DCV</span>
+          <div class="page-head-right">
+            <span id="modeBadge" class="badge badge-voltage">电压</span>
+            <span id="pageCode" class="code-pill">DCV</span>
+          </div>
         </div>
         <p id="pageNote" class="page-note">—</p>
 
-        <div class="readout-tags">
-          <span id="modeBadge" class="badge badge-voltage">电压</span>
-          <span id="rangeLabel" class="tag">—</span>
-          <span id="rateLabel" class="tag">—</span>
-          <span id="sampleRate" class="tag">—</span>
-          <span id="triggerLabel" class="tag">—</span>
-          <span id="deviceId" class="tag tag-muted" title="仪器身份">—</span>
-        </div>
-        <div class="readout" id="readout">
-          <span id="valueText" class="value">--</span>
-          <span id="unitText" class="unit">V</span>
+        <div class="display" id="readout">
+          <div class="annunciators" aria-label="仪器状态">
+            <span id="rangeLabel" class="ann on" title="量程">—</span>
+            <span id="rateLabel" class="ann on" title="采样速率">—</span>
+            <span id="triggerLabel" class="ann on" title="触发源">—</span>
+            <span id="nullBadge" class="ann" title="NULL 相对值">NULL</span>
+            <span id="holdBadge" class="ann ann-warn" title="显示保持">HOLD</span>
+            <span id="alarmAnn" class="ann ann-bad" title="限值报警">ALM</span>
+            <span class="ann-spacer"></span>
+            <span id="sampleRate" class="ann ann-rate" title="实际采样率">—</span>
+            <span id="activityLed" class="act-led" title="采样指示"></span>
+          </div>
+          <button type="button" class="value-line" id="valueCopy" title="点击复制读数">
+            <span id="valueText" class="value">--</span>
+            <span id="unitText" class="unit">V</span>
+          </button>
+          <div class="display-state" id="displayState"></div>
+          <div class="scanbar" aria-hidden="true"></div>
         </div>
         <div id="alarmBanner" class="alarm-banner hidden"></div>
+
+        <div class="sub-readouts" id="subReadouts">
+          <div class="sub"><label>MIN</label><b id="subMin">—</b></div>
+          <div class="sub"><label>AVG</label><b id="subAvg">—</b></div>
+          <div class="sub"><label>MAX</label><b id="subMax">—</b></div>
+          <div class="sub"><label>P-P</label><b id="subPp">—</b></div>
+        </div>
+
+        <div class="readout-actions">
+          <button id="holdToggle" class="btn btn-ghost btn-sm" aria-pressed="false" title="冻结读数显示 (H)">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+            <span>保持 HOLD</span>
+          </button>
+          <button id="copyValue" class="btn btn-ghost btn-sm" title="复制当前读数 (C)">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+            <span>复制</span>
+          </button>
+        </div>
+
         <div class="readout-foot">
           <span id="burdenItem" class="hidden">Burden 电压 <b id="burdenText">—</b></span>
           <span id="shuntItem" class="hidden">分流电阻 <b id="shuntInfo">—</b></span>
           <span>样本 <b id="sampleCount">0</b></span>
+          <span id="deviceId" class="foot-idn" title="仪器身份">—</span>
         </div>
       </section>
 
@@ -78,14 +115,17 @@
             <span id="zoomHint" class="zoom-hint-inline">滚轮缩放 · 拖动平移</span>
           </div>
           <div class="head-tools">
-            <div class="seg" id="windowGroup">
+            <div class="seg" id="windowGroup" role="group" aria-label="时间窗口">
               <button data-window="10">10s</button>
               <button data-window="30">30s</button>
               <button data-window="60" class="active">60s</button>
               <button data-window="300">5min</button>
               <button data-window="0">全部</button>
             </div>
-            <button id="tableToggle" class="btn btn-ghost btn-sm">表格</button>
+            <div class="seg" id="viewGroup" role="group" aria-label="显示方式">
+              <button data-view="chart" class="active" title="曲线 (T 切换)">曲线</button>
+              <button data-view="table" title="表格 (T 切换)">表格</button>
+            </div>
           </div>
         </div>
         <div class="chart-wrap" id="chartWrap">
@@ -93,9 +133,9 @@
           <div id="chartEmpty" class="chart-empty">等待数据…</div>
           <div id="chartTip" class="chart-tip hidden"></div>
           <div class="chart-tools">
-            <button id="zoomOut" title="缩小时间轴">−</button>
-            <button id="zoomIn" title="放大时间轴">+</button>
-            <button id="zoomLive" title="回到实时">实时</button>
+            <button id="zoomOut" title="缩小时间轴 (−)">−</button>
+            <button id="zoomIn" title="放大时间轴 (+)">+</button>
+            <button id="zoomLive" title="回到实时 (L)"><span class="live-dot"></span>实时</button>
           </div>
         </div>
         <div id="tableWrap" class="table-wrap hidden">
@@ -112,12 +152,13 @@
       <div class="card-head">
         <h2>统计</h2>
         <div class="head-tools">
-          <button id="statsConfigBtn" class="btn btn-ghost btn-sm">设置</button>
-          <button id="statsReset" class="btn btn-ghost btn-sm">重置</button>
+          <span id="statsSince" class="hint-inline"></span>
+          <button id="statsConfigBtn" class="btn btn-ghost btn-sm" aria-expanded="false">选择统计项</button>
+          <button id="statsReset" class="btn btn-ghost btn-sm" title="清零统计 (R)">重置</button>
         </div>
       </div>
       <div id="statsGrid" class="stats-grid"></div>
-      <div id="statsConfig" class="stats-config hidden">
+      <div id="statsConfig" class="stats-config pop hidden">
         <div class="stats-config-head">
           <span>显示统计项</span>
           <span id="statsConfigCount" class="hint-inline"></span>
@@ -126,6 +167,7 @@
         <div class="btn-row">
           <button id="statsConfigDefault" class="btn btn-ghost btn-sm">恢复默认</button>
           <button id="statsConfigAll" class="btn btn-ghost btn-sm">全选</button>
+          <span class="flex-spacer"></span>
           <button id="statsConfigClose" class="btn btn-primary btn-sm">完成</button>
         </div>
       </div>
@@ -135,7 +177,7 @@
       <!-- 分流测电流 -->
       <section class="card shunt-card">
         <div class="card-head"><h2>分流电阻测电流</h2></div>
-        <div class="seg seg-wide" id="modeGroup">
+        <div class="seg seg-wide" id="modeGroup" role="group" aria-label="显示模式">
           <button data-mode="voltage">直接测量</button>
           <button data-mode="current">分流电流</button>
         </div>
@@ -151,6 +193,7 @@
         </div>
         <div class="btn-row">
           <button id="applyShunt" class="btn btn-primary">应用分流设置</button>
+          <span id="shuntDirtyTag" class="dirty-tag hidden">未应用 · 回车确认</span>
         </div>
         <p class="hint">I = V / R。分流模式会强制使用 DCV 档，请确认电阻功率与 burden 电压安全。</p>
       </section>
@@ -162,7 +205,7 @@
           <span id="limitModeLabel" class="tag">作用量：电压</span>
         </div>
         <label class="switch-row">
-          <input type="checkbox" id="limitEnabled">
+          <input type="checkbox" id="limitEnabled" class="switch">
           <span>启用上下限报警</span>
         </label>
         <div class="form-row">
@@ -182,6 +225,7 @@
         <div class="btn-row">
           <button id="applyLimits" class="btn btn-primary">应用限值</button>
           <span id="limitState" class="tag">未启用</span>
+          <span id="limitsDirtyTag" class="dirty-tag hidden">未应用 · 回车确认</span>
         </div>
         <p class="hint" id="limitHint">限值作用于当前显示量；电阻/频率功能暂不支持软件限值。</p>
       </section>
@@ -193,9 +237,15 @@
         <h2>数据记录</h2>
         <span id="logStatus" class="tag">未记录</span>
       </div>
-      <div class="btn-row">
-        <button id="logStart" class="btn btn-primary">开始记录</button>
-        <button id="logStop" class="btn btn-ghost" disabled>停止记录</button>
+      <div class="log-control">
+        <div class="btn-row log-buttons">
+          <button id="logStart" class="btn btn-rec"><span class="rec-glyph"></span>开始记录</button>
+          <button id="logStop" class="btn btn-ghost" disabled><span class="stop-glyph"></span>停止记录</button>
+        </div>
+        <div class="log-meter">
+          <span class="log-meter-time" id="logElapsed">00:00:00</span>
+          <span class="log-meter-rows"><b id="logRows">0</b> 行</span>
+        </div>
       </div>
       <p class="hint" id="logFileInfo">CSV 保存到 data/logs/</p>
       <div class="log-list-head">
@@ -218,7 +268,12 @@
     </section>
 
     <section class="card control-card">
-      <div class="card-head"><h2>量程 / 速率 / 触发 / 积分</h2></div>
+      <div class="card-head">
+        <h2>量程 / 速率 / 触发</h2>
+        <button id="syncState" class="icon-btn icon-btn-sm" title="从仪器回读状态" aria-label="刷新状态">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+        </button>
+      </div>
       <div class="form-row">
         <label for="rangeSelect">量程</label>
         <select id="rangeSelect"></select>
@@ -246,9 +301,18 @@
         </div>
         <p class="hint">0.02–100 PLC 或 0.00001–10 s；应用后切换为 PR0 自由采样</p>
       </div>
-      <div class="readback" id="readbackChips"></div>
-      <div class="btn-row">
-        <button id="syncState" class="btn btn-ghost">刷新状态</button>
+      <div class="null-block">
+        <div class="null-head">
+          <span>NULL 相对值</span>
+          <label class="switch-row null-switch">
+            <span id="nullStateText">关闭</span>
+            <input type="checkbox" id="nullToggle" class="switch">
+          </label>
+        </div>
+        <div class="null-row">
+          <span>参考值 <b id="nullRef">—</b></span>
+          <button id="nullTake" class="btn btn-ghost btn-sm">取当前读数</button>
+        </div>
       </div>
       <p class="hint" id="controlHint">选择后立即生效，以仪器回读值为准。</p>
     </section>
@@ -262,7 +326,7 @@
 </footer>
 
 <div id="advBackdrop" class="drawer-backdrop hidden"></div>
-<aside id="advDrawer" class="drawer hidden" aria-hidden="true">
+<aside id="advDrawer" class="drawer hidden" aria-hidden="true" role="dialog" aria-label="高级设置">
   <div class="drawer-head">
     <div>
       <h2>高级设置</h2>
@@ -270,14 +334,53 @@
     </div>
     <div class="drawer-head-actions">
       <button id="advRefresh" class="btn btn-ghost btn-sm">刷新</button>
-      <button id="advClose" class="icon-btn" aria-label="关闭高级设置">✕</button>
+      <button id="advClose" class="icon-btn" aria-label="关闭高级设置" title="关闭 (Esc)">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
     </div>
+  </div>
+  <div class="drawer-search">
+    <input id="advSearch" type="search" placeholder="筛选设置项…" autocomplete="off">
   </div>
   <div id="advBody" class="drawer-body"></div>
 </aside>
 
-<div id="toast" class="toast hidden"></div>
+<!-- 确认对话框 -->
+<div id="confirmLayer" class="modal-layer hidden">
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <h3 id="confirmTitle">确认操作</h3>
+    <p id="confirmText"></p>
+    <div class="btn-row modal-actions">
+      <button id="confirmCancel" class="btn btn-ghost">取消</button>
+      <button id="confirmOk" class="btn btn-danger">确认执行</button>
+    </div>
+  </div>
+</div>
 
-<script src="/static/app.js"></script>
+<!-- 快捷键 -->
+<div id="helpLayer" class="modal-layer hidden">
+  <div class="modal modal-help" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+    <h3 id="helpTitle">快捷键</h3>
+    <dl class="kbd-list">
+      <dt><kbd>H</kbd></dt><dd>保持 / 释放读数显示</dd>
+      <dt><kbd>C</kbd></dt><dd>复制当前读数</dd>
+      <dt><kbd>L</kbd></dt><dd>趋势图回到实时</dd>
+      <dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>放大 / 缩小时间轴</dd>
+      <dt><kbd>T</kbd></dt><dd>曲线 / 表格切换</dd>
+      <dt><kbd>R</kbd></dt><dd>重置统计</dd>
+      <dt><kbd>A</kbd></dt><dd>打开高级设置</dd>
+      <dt><kbd>Enter</kbd></dt><dd>在输入框中直接应用</dd>
+      <dt><kbd>Esc</kbd></dt><dd>关闭弹层 / 抽屉</dd>
+      <dt><kbd>← →</kbd></dt><dd>趋势图聚焦时逐点查看</dd>
+    </dl>
+    <div class="btn-row modal-actions">
+      <button id="helpClose" class="btn btn-primary">知道了</button>
+    </div>
+  </div>
+</div>
+
+<div id="toastStack" class="toast-stack" aria-live="polite"></div>
+
+<script src="/static/app.js?v={{ asset_v }}"></script>
 </body>
 </html>
